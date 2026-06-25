@@ -1,35 +1,44 @@
-# deps: none beyond stdlib (threading, time) + project modules
+# deps: none beyond stdlib + project modules
 """
 core/scheduler.py
 
-Job: the conductor.
+Three-tier scan coordinator per network:
 
-On startup:
-  1. Calls RouterDetector once to get the list of active networks.
-  2. Runs a timing loop:
-       - ScapyScanner  every ~60s   per network  (fast ARP sweep)
-       - NmapScanner   every ~10min per network  (deep fingerprint)
-  3. Passes every scan result to device_store — scheduler never stores
-     anything itself, it only routes.
+  Tier 1 — Scapy ARP        every 60s   → fast device presence
+  Tier 2 — Nmap quick       every 180s  → vendor/hostname refresh
+  Tier 3 — Nmap aggressive  every 360s  → full OS/port/service fingerprint
+                                           threaded pool of 4 workers
+                                           targets ONLY live IPs from Scapy,
+                                           not blind subnet sweep
 
-Rules:
-  - Nmap and Scapy NEVER scan the same network simultaneously.
-    Enforced by a per-network threading.Lock().
-  - Only this module is allowed to import both detection/ and core/scanners.
-  - device_store is injected at construction — scheduler never opens the DB.
-  - Graceful shutdown on stop(): running scans finish, loop exits cleanly.
-  - If RouterDetector returns [] (airplane mode / no interfaces), the
-    scheduler enters a wait-and-retry loop rather than crashing.
+Lock model:
+  One threading.Lock per network CIDR. All three tiers acquire the same
+  lock before scanning, so no two scanners ever hit the same network
+  simultaneously. The aggressive tier holds the lock for longer — that's
+  intentional and correct, Scapy and quick-nmap simply wait their turn.
+
+Live-host cache:
+  Scapy ARP results are stored in self._live_hosts[network] after every
+  sweep. Nmap quick and aggressive tiers read from this cache — they never
+  blindly sweep the whole /24. This is the Option B "smart targeting"
+  architecture: find who's alive cheaply with ARP, fingerprint only those.
+
+MAC normalization:
+  Scapy returns lowercase MACs, Nmap returns uppercase. Both are lowercased
+  before being handed to device_store so no duplicate rows are created.
 """
 
 import time
 import threading
 import logging
-from typing import List, Dict, Optional, Callable
+from typing import List, Dict, Set
+from concurrent.futures import ThreadPoolExecutor
 
 from cerberus.detection.router_detector import RouterDetector
 from cerberus.core.scanner_scapy import ScapyScanner
 from cerberus.core.scanner_nmap import NmapScanner
+from cerberus.intelligence.trust_engine import TrustEngine, TrustVerdict
+from cerberus.intelligence.learning_mode import LearningMode
 
 logger = logging.getLogger("cerberus.core.scheduler")
 
@@ -39,21 +48,17 @@ logger = logging.getLogger("cerberus.core.scheduler")
 # ---------------------------------------------------------------------------
 
 class _NetworkLockRegistry:
-    """
-    Hands out one threading.Lock per network CIDR string.
-    Scapy and Nmap both acquire the same lock for the same network,
-    so they can never run simultaneously on it.
-    """
+    """One threading.Lock per network CIDR. Thread-safe registry."""
 
     def __init__(self):
         self._locks: Dict[str, threading.Lock] = {}
-        self._meta_lock = threading.Lock()  # protects the registry dict itself
+        self._meta  = threading.Lock()
 
     def get(self, network: str) -> threading.Lock:
-        with self._meta_lock:
+        with self._meta:
             if network not in self._locks:
                 self._locks[network] = threading.Lock()
-                logger.debug(f"Created lock for network: {network}")
+                logger.debug(f"Lock created for {network}")
             return self._locks[network]
 
 
@@ -63,63 +68,59 @@ class _NetworkLockRegistry:
 
 class Scheduler:
     """
-    Coordinates Scapy and Nmap scans across all detected networks.
-
-    Usage:
-        store = DeviceStore("data/devices.db")   # injected, never opened here
-        scheduler = Scheduler(device_store=store)
-        scheduler.start()   # blocks until stop() called from another thread
-                            # or run headless via start(blocking=False)
-        ...
-        scheduler.stop()
+    Three-tier scan coordinator.
 
     Args:
-        device_store      : Any object with an `upsert(device_dict)` method.
-                            Passed in — scheduler never imports storage directly.
-        scapy_interval    : Seconds between Scapy ARP sweeps per network.
-        nmap_interval     : Seconds between Nmap deep scans per network.
-        network_retry_wait: Seconds to wait before retrying network detection
-                            if RouterDetector returns no interfaces.
-        scapy_timeout     : ARP reply timeout passed to ScapyScanner.
-        nmap_deep         : If True, Nmap runs deep scan (-A). False = ping only.
+        device_store         : Any object with upsert(dict) method.
+        scapy_interval       : Seconds between ARP sweeps (default 60).
+        nmap_quick_interval  : Seconds between quick Nmap sweeps (default 180).
+        nmap_aggressive_interval: Seconds between aggressive scans (default 360).
+        aggressive_workers   : Thread pool size for aggressive scans (default 4).
+        network_retry_wait   : Seconds to wait if no interfaces found (default 30).
+        scapy_timeout        : ARP reply timeout in seconds (default 3).
     """
 
     def __init__(
         self,
         device_store,
-        scapy_interval: int = 60,
-        nmap_interval: int = 600,       # 10 minutes
-        network_retry_wait: int = 30,
-        scapy_timeout: int = 3,
-        nmap_deep: bool = True,
+        trust_engine:              TrustEngine  = None,
+        learning_mode:             LearningMode = None,
+        scapy_interval:            int = 60,
+        nmap_quick_interval:       int = 180,
+        nmap_aggressive_interval:  int = 360,
+        aggressive_workers:        int = 4,
+        network_retry_wait:        int = 30,
+        scapy_timeout:             int = 3,
     ):
-        self.device_store = device_store
-        self.scapy_interval = scapy_interval
-        self.nmap_interval = nmap_interval
-        self.network_retry_wait = network_retry_wait
+        self.device_store               = device_store
+        self._trust_engine              = trust_engine or TrustEngine()
+        self._learning_mode             = learning_mode  # None = no learning mode
+        self.scapy_interval             = scapy_interval
+        self.nmap_quick_interval        = nmap_quick_interval
+        self.nmap_aggressive_interval   = nmap_aggressive_interval
+        self.aggressive_workers         = aggressive_workers
+        self.network_retry_wait         = network_retry_wait
 
-        # Scanners — stateless, instantiated once, reused per call
+        # Scanners — stateless, one instance each, reused per call
         self._scapy = ScapyScanner(timeout=scapy_timeout, wake_up_ping=True)
-        self._nmap = NmapScanner()
-        self._nmap_deep = nmap_deep
+        self._nmap  = NmapScanner()
 
-        # Per-network mutex registry
-        self._locks = _NetworkLockRegistry()
+        # Live-host cache: network → set of IP strings from last Scapy sweep
+        self._live_hosts: Dict[str, Set[str]] = {}
+        self._live_hosts_lock = threading.Lock()
 
-        # Shutdown flag — set by stop(), checked by all loops
+        self._locks      = _NetworkLockRegistry()
         self._stop_event = threading.Event()
-
-        # Active worker threads (one Scapy + one Nmap per network)
-        self._threads: List[threading.Thread] = []
-
-        # Current known networks (refreshed on restart)
-        self._networks: List[Dict] = []
+        self._threads:   List[threading.Thread] = []
+        self._networks:  List[Dict] = []
 
         logger.info(
             f"Scheduler created — "
-            f"scapy_interval={scapy_interval}s  "
-            f"nmap_interval={nmap_interval}s  "
-            f"nmap_deep={nmap_deep}"
+            f"scapy={scapy_interval}s  "
+            f"nmap-quick={nmap_quick_interval}s  "
+            f"nmap-aggressive={nmap_aggressive_interval}s  "
+            f"workers={aggressive_workers}  "
+            f"learning_mode={'ON' if learning_mode else 'OFF'}"
         )
 
     # ------------------------------------------------------------------
@@ -127,27 +128,18 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     def start(self, blocking: bool = True) -> None:
-        """
-        Detect networks, spin up worker threads, then either block
-        (blocking=True, for headless cerberus_main.py) or return
-        immediately (blocking=False, for tests or embedding).
-        """
         logger.info("Scheduler starting...")
         self._stop_event.clear()
 
         self._networks = self._detect_networks_with_retry()
         if not self._networks:
-            logger.critical(
-                "No networks found after retrying — scheduler cannot start."
-            )
+            logger.critical("No networks found — scheduler cannot start.")
             return
 
         self._spawn_workers()
 
         if blocking:
-            logger.info(
-                "Scheduler running. Press Ctrl+C to stop."
-            )
+            logger.info("Scheduler running. Press Ctrl+C to stop.")
             try:
                 while not self._stop_event.is_set():
                     time.sleep(1)
@@ -156,16 +148,10 @@ class Scheduler:
                 self.stop()
 
     def stop(self) -> None:
-        """
-        Signal all worker threads to finish their current scan and exit.
-        Blocks until every thread has joined.
-        """
         logger.info("Scheduler stopping — waiting for workers to finish...")
         self._stop_event.set()
-
         for t in self._threads:
             t.join()
-
         self._threads.clear()
         logger.info("Scheduler stopped.")
 
@@ -175,65 +161,83 @@ class Scheduler:
             t.is_alive() for t in self._threads
         )
 
+    def status(self) -> Dict:
+        live_counts = {}
+        with self._live_hosts_lock:
+            for net, ips in self._live_hosts.items():
+                live_counts[net] = len(ips)
+        return {
+            "running":                   self.is_running,
+            "networks":                  [n["network"] for n in self._networks],
+            "scapy_interval":            self.scapy_interval,
+            "nmap_quick_interval":       self.nmap_quick_interval,
+            "nmap_aggressive_interval":  self.nmap_aggressive_interval,
+            "aggressive_workers":        self.aggressive_workers,
+            "live_hosts_per_network":    live_counts,
+            "active_threads":            [t.name for t in self._threads if t.is_alive()],
+        }
+
     # ------------------------------------------------------------------
-    # Network detection with retry
+    # Network detection
     # ------------------------------------------------------------------
 
     def _detect_networks_with_retry(self) -> List[Dict]:
-        """
-        Call RouterDetector until at least one network is found, or until
-        stop() is called. Returns [] only if stop() fires during the wait.
-        """
         detector = RouterDetector()
-
         while not self._stop_event.is_set():
             networks = detector.get_all_networks()
-
             if networks:
                 logger.info(
                     f"Detected {len(networks)} network(s): "
                     + ", ".join(n["network"] for n in networks)
                 )
                 return networks
-
             logger.warning(
-                f"No active networks found. "
-                f"Retrying in {self.network_retry_wait}s... "
-                f"(Is the machine connected?)"
+                f"No active networks. Retrying in {self.network_retry_wait}s..."
             )
             time.sleep(self.network_retry_wait)
-
         return []
 
     # ------------------------------------------------------------------
-    # Worker thread spawning
+    # Worker spawning — 3 threads per network
     # ------------------------------------------------------------------
 
     def _spawn_workers(self) -> None:
-        """Start one Scapy thread + one Nmap thread per detected network."""
         for net_info in self._networks:
             network = net_info["network"]
-            iface = net_info["interface"]
+            iface   = net_info["interface"]
 
-            scapy_thread = threading.Thread(
-                target=self._scapy_worker,
-                args=(network, iface),
-                name=f"scapy-{network}",
-                daemon=True,
-            )
-            nmap_thread = threading.Thread(
-                target=self._nmap_worker,
-                args=(network, iface),
-                name=f"nmap-{network}",
-                daemon=True,
-            )
+            # Initialise live-host cache for this network
+            with self._live_hosts_lock:
+                self._live_hosts[network] = set()
 
-            self._threads.extend([scapy_thread, nmap_thread])
-            scapy_thread.start()
-            nmap_thread.start()
+            threads = [
+                threading.Thread(
+                    target=self._scapy_worker,
+                    args=(network, iface),
+                    name=f"scapy-{network}",
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=self._nmap_quick_worker,
+                    args=(network, iface),
+                    name=f"nmap-quick-{network}",
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=self._nmap_aggressive_worker,
+                    args=(network, iface),
+                    name=f"nmap-agg-{network}",
+                    daemon=True,
+                ),
+            ]
+
+            for t in threads:
+                self._threads.append(t)
+                t.start()
 
             logger.info(
-                f"Workers started for {network} on {iface}"
+                f"3 workers started for {network} on {iface} — "
+                f"[scapy / nmap-quick / nmap-aggressive]"
             )
 
     # ------------------------------------------------------------------
@@ -242,111 +246,206 @@ class Scheduler:
 
     def _scapy_worker(self, network: str, iface: str) -> None:
         """
-        Runs forever (until stop_event set):
-          acquire network lock → scan → route to store → release → sleep.
+        Tier 1 — ARP sweep every scapy_interval seconds.
+        Updates the live-host cache after every sweep so the Nmap workers
+        always target current, confirmed-alive IPs.
         """
-        logger.info(f"[scapy-worker] Started for {network}")
+        logger.info(f"[scapy] Started → {network}")
 
         while not self._stop_event.is_set():
             lock = self._locks.get(network)
-
             with lock:
-                logger.debug(f"[scapy-worker] Acquired lock for {network}")
+                logger.debug(f"[scapy] Scanning {network}")
                 devices = self._scapy.scan(network)
 
             if devices:
+                # Normalize MACs before storing
+                for d in devices:
+                    if d.get("mac"):
+                        d["mac"] = d["mac"].lower()
+
+                # Update live-host cache
+                live_ips = {d["ip"] for d in devices}
+                with self._live_hosts_lock:
+                    self._live_hosts[network] = live_ips
+
                 self._route_to_store(devices, scanner="scapy", iface=iface)
-            else:
-                logger.debug(
-                    f"[scapy-worker] No devices on {network} this cycle."
+                logger.info(
+                    f"[scapy] {network} → {len(devices)} device(s) | "
+                    f"live: {sorted(live_ips)}"
                 )
 
-            # Interruptible sleep — checks stop_event every second
+                # --- Learning mode: auto-trust during baseline window ---
+                if self._learning_mode and self._learning_mode.is_active():
+                    all_devices = self.device_store.get_all()
+                    self._learning_mode.auto_trust_all(all_devices)
+
+                # --- Trust engine: evaluate verdicts every cycle ---
+                self._run_trust_evaluation(network)
+
+            else:
+                logger.debug(f"[scapy] No devices on {network} this cycle.")
+
             self._interruptible_sleep(self.scapy_interval)
 
-        logger.info(f"[scapy-worker] Exiting for {network}")
+        logger.info(f"[scapy] Exiting → {network}")
 
-    def _nmap_worker(self, network: str, iface: str) -> None:
+    def _nmap_quick_worker(self, network: str, iface: str) -> None:
         """
-        Runs forever (until stop_event set):
-          sleep first (Scapy gets first look), then
-          acquire network lock → scan → route to store → release → sleep.
-
-        Nmap sleeps first so it doesn't compete with Scapy on startup.
+        Tier 2 — Quick ping sweep every nmap_quick_interval seconds.
+        Updates vendor and hostname fields. Runs on live IPs only.
+        Sleeps for one full quick interval on startup so Scapy always
+        populates the live-host cache before Nmap reads it.
         """
-        logger.info(f"[nmap-worker] Started for {network} — first scan in {self.nmap_interval}s")
-
-        # Initial delay — let Scapy run its first sweep first
-        self._interruptible_sleep(self.nmap_interval)
+        logger.info(
+            f"[nmap-quick] Started → {network} | "
+            f"first scan in {self.nmap_quick_interval}s"
+        )
+        self._interruptible_sleep(self.nmap_quick_interval)
 
         while not self._stop_event.is_set():
-            lock = self._locks.get(network)
+            live_ips = self._get_live_ips(network)
 
-            with lock:
-                logger.debug(f"[nmap-worker] Acquired lock for {network}")
-                if self._nmap_deep:
-                    devices = self._nmap.scan_deep(network)
-                else:
-                    devices = self._nmap.scan_quick(network)
+            if live_ips:
+                lock = self._locks.get(network)
+                with lock:
+                    logger.debug(f"[nmap-quick] Scanning {len(live_ips)} host(s) on {network}")
+                    # Pass space-separated IPs to Nmap — it accepts this fine.
+                    # Then force 'network' field to the CIDR so device_store
+                    # never sees "192.168.1.1 192.168.1.5" as the network value.
+                    targets = " ".join(sorted(live_ips))
+                    devices = self._nmap.scan_quick(targets)
 
-            if devices:
-                self._route_to_store(devices, scanner="nmap", iface=iface)
+                if devices:
+                    for d in devices:
+                        d["network"] = network  # always overwrite with real CIDR
+                    self._route_to_store(devices, scanner="nmap_quick", iface=iface)
+                    logger.info(
+                        f"[nmap-quick] {network} → {len(devices)} device(s) updated"
+                    )
             else:
                 logger.debug(
-                    f"[nmap-worker] No devices on {network} this cycle."
+                    f"[nmap-quick] No live hosts on {network} yet — skipping."
                 )
 
-            self._interruptible_sleep(self.nmap_interval)
+            self._interruptible_sleep(self.nmap_quick_interval)
 
-        logger.info(f"[nmap-worker] Exiting for {network}")
+        logger.info(f"[nmap-quick] Exiting → {network}")
+
+    def _nmap_aggressive_worker(self, network: str, iface: str) -> None:
+        """
+        Tier 3 — Full aggressive fingerprint every nmap_aggressive_interval.
+        Targets only confirmed-alive IPs from Scapy cache.
+        Uses a thread pool (aggressive_workers) to scan multiple hosts
+        in parallel — one thread per host, up to the pool limit.
+        Starts after one full aggressive interval so Scapy and quick-nmap
+        both run first and populate the cache.
+        """
+        logger.info(
+            f"[nmap-aggressive] Started → {network} | "
+            f"first scan in {self.nmap_aggressive_interval}s"
+        )
+        self._interruptible_sleep(self.nmap_aggressive_interval)
+
+        while not self._stop_event.is_set():
+            live_ips = self._get_live_ips(network)
+
+            if live_ips:
+                lock = self._locks.get(network)
+                with lock:
+                    logger.info(
+                        f"[nmap-aggressive] Fingerprinting {len(live_ips)} "
+                        f"host(s) on {network} | workers={self.aggressive_workers}"
+                    )
+                    devices = self._nmap.scan_aggressive_hosts(
+                        list(live_ips),
+                        network,
+                        workers=self.aggressive_workers,
+                    )
+
+                if devices:
+                    for d in devices:
+                        d["network"] = network  # always overwrite with real CIDR
+                    self._route_to_store(
+                        devices, scanner="nmap_aggressive", iface=iface
+                    )
+                    logger.info(
+                        f"[nmap-aggressive] {network} → "
+                        f"{len(devices)} host(s) fully fingerprinted"
+                    )
+            else:
+                logger.debug(
+                    f"[nmap-aggressive] No live hosts on {network} — skipping."
+                )
+
+            self._interruptible_sleep(self.nmap_aggressive_interval)
+
+        logger.info(f"[nmap-aggressive] Exiting → {network}")
 
     # ------------------------------------------------------------------
-    # Routing to storage
+    # Storage routing
     # ------------------------------------------------------------------
+
+    def _run_trust_evaluation(self, network: str) -> None:
+        """
+        Pull current device list from store, run trust_engine on it,
+        log every alert-worthy verdict. Phase 3 alert_manager plugs in here.
+        """
+        try:
+            all_devices = self.device_store.get_all()
+            if not all_devices:
+                return
+
+            verdicts = self._trust_engine.evaluate(all_devices)
+
+            for v in verdicts:
+                if v.verdict.value == TrustVerdict.UNTRUSTED_NEW.value:
+                    logger.warning(
+                        f"[trust] ⚠ NEW UNKNOWN DEVICE — "
+                        f"{v.display_name} | {v.ip} | {v.mac} | "
+                        f"vendor={v.vendor or 'unknown'}"
+                    )
+                elif v.verdict.value == TrustVerdict.UNTRUSTED_RETURNING.value:
+                    rand_tag = " [MAC randomization suspected]" \
+                               if v.mac_randomization_suspected else ""
+                    logger.warning(
+                        f"[trust] ↩ RETURNING UNKNOWN — "
+                        f"{v.display_name} | {v.ip} | {v.mac}{rand_tag}"
+                    )
+                # TRUSTED verdicts logged at DEBUG only — not noise in normal ops
+                else:
+                    logger.debug(
+                        f"[trust] ✔ trusted — {v.display_name} | {v.ip}"
+                    )
+        except Exception as e:
+            logger.error(f"[trust] Trust evaluation error: {e}")
 
     def _route_to_store(
         self, devices: List[Dict], scanner: str, iface: str
     ) -> None:
-        """
-        Hand each device dict to device_store.upsert().
-        Scheduler does zero storage logic — it just routes.
-
-        Adds 'scanner' and 'interface' fields so device_store can log them
-        in scan_history without needing to know which worker called it.
-        """
+        """Hand each device to device_store.upsert(). Never stores anything itself."""
         for device in devices:
             record = {**device, "scanner": scanner, "interface": iface}
             try:
                 self.device_store.upsert(record)
             except Exception as e:
-                # Storage failure must never kill the scan loop
                 logger.error(
-                    f"device_store.upsert failed for {device.get('ip')}: {e}"
+                    f"device_store.upsert failed for "
+                    f"{device.get('ip', '?')}: {e}"
                 )
 
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
 
+    def _get_live_ips(self, network: str) -> Set[str]:
+        """Thread-safe read of the live-host cache for one network."""
+        with self._live_hosts_lock:
+            return set(self._live_hosts.get(network, set()))
+
     def _interruptible_sleep(self, seconds: int) -> None:
-        """
-        Sleep in 1s increments so stop_event is checked frequently.
-        Avoids the scanner being stuck sleeping for 10 minutes on shutdown.
-        """
+        """Sleep in 1s ticks — responds to stop_event within 1 second."""
         for _ in range(seconds):
             if self._stop_event.is_set():
                 return
             time.sleep(1)
-
-    def status(self) -> Dict:
-        """
-        Return a snapshot of scheduler state for cerberus_main / CLI.
-        """
-        return {
-            "running": self.is_running,
-            "networks": [n["network"] for n in self._networks],
-            "scapy_interval": self.scapy_interval,
-            "nmap_interval": self.nmap_interval,
-            "nmap_deep": self._nmap_deep,
-            "active_threads": [t.name for t in self._threads if t.is_alive()],
-        }
