@@ -44,7 +44,7 @@ class ScapyScanner:
     network string in, this class never goes looking for it itself.
     """
 
-    def __init__(self, timeout: int = 3, wake_up_ping: bool = True):
+    def __init__(self, timeout: int = 5, wake_up_ping: bool = True):
         """
         Args:
             timeout      : Seconds to wait for ARP replies per scan.
@@ -66,14 +66,14 @@ class ScapyScanner:
     def scan(self, network: str) -> List[Dict[str, str]]:
         """
         ARP-scan one network CIDR and return responding devices.
+        Sends ARP twice — catches devices that missed the first packet.
 
         Args:
             network: CIDR string, e.g. '192.168.1.0/24'
 
         Returns:
             List of dicts — each has 'ip', 'mac', 'network'.
-            Returns [] on any failure (permission error, no responses,
-            bad network string, etc.).
+            Returns [] on any failure.
         """
         if not network:
             logger.error("scan() called with empty network string.")
@@ -87,17 +87,27 @@ class ScapyScanner:
         try:
             arp_request = ARP(pdst=network)
             ether_frame = Ether(dst="ff:ff:ff:ff:ff:ff")
-            packet = ether_frame / arp_request
+            packet      = ether_frame / arp_request
 
+            # First pass
             answered, _ = srp(packet, timeout=self.timeout, verbose=0)
 
+            # Second pass — catches devices that missed the first ARP
+            time.sleep(0.5)
+            answered2, _ = srp(packet, timeout=self.timeout, verbose=0)
+
+            # Merge both passes, deduplicate by MAC
+            seen_macs: set = set()
             devices: List[Dict[str, str]] = []
-            for _, received in answered:
-                devices.append({
-                    "ip":      received.psrc,
-                    "mac":     received.hwsrc,
-                    "network": network,          # BUG FIX 1: was `network: network`
-                })
+            for _, received in list(answered) + list(answered2):
+                mac = received.hwsrc.lower()
+                if mac not in seen_macs:
+                    seen_macs.add(mac)
+                    devices.append({
+                        "ip":      received.psrc,
+                        "mac":     mac,
+                        "network": network,
+                    })
 
             logger.info(
                 f"ARP scan done → {network} | "
