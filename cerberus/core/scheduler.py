@@ -26,18 +26,32 @@ Live-host cache:
 MAC normalization:
   Scapy returns lowercase MACs, Nmap returns uppercase. Both are lowercased
   before being handed to device_store so no duplicate rows are created.
+
+Alert wiring (Phase 3, module 12):
+  Scheduler accepts an optional `alert_manager` instance. After every
+  trust evaluation, verdicts are handed to alert_manager.process_verdicts().
+  If no alert_manager is passed, behaviour is identical to before —
+  verdicts are logged locally only.
+
+Alert persistence (Phase 3, module 13 prep):
+  alert_manager.process_verdicts() now returns the list of verdicts it
+  actually fired (post-cooldown, post-dispatch). Scheduler — which
+  already holds the device_store reference — logs each fired verdict
+  to device_store.log_alert(). alert_manager itself never touches the
+  DB; this keeps that boundary intact while giving the system real,
+  persistent alert history for cerberus_service / CLI / API to read.
 """
 
 import time
 import threading
 import logging
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Optional
 from concurrent.futures import ThreadPoolExecutor
 
 from cerberus.detection.router_detector import RouterDetector
 from cerberus.core.scanner_scapy import ScapyScanner
 from cerberus.core.scanner_nmap import NmapScanner
-from cerberus.intelligence.trust_engine import TrustEngine, TrustVerdict
+from cerberus.intelligence.trust_engine import TrustEngine, TrustVerdict, DeviceVerdict
 from cerberus.intelligence.learning_mode import LearningMode
 
 logger = logging.getLogger("cerberus.core.scheduler")
@@ -71,7 +85,13 @@ class Scheduler:
     Three-tier scan coordinator.
 
     Args:
-        device_store         : Any object with upsert(dict) method.
+        device_store         : Any object with upsert(dict) method, plus
+                                log_alert() for alert history persistence.
+        trust_engine          : TrustEngine instance (created internally if None).
+        learning_mode          : LearningMode instance, or None to disable.
+        alert_manager           : AlertManager instance, or None to disable
+                                   alert dispatch entirely (verdicts still
+                                   get logged locally either way).
         scapy_interval       : Seconds between ARP sweeps (default 60).
         nmap_quick_interval  : Seconds between quick Nmap sweeps (default 180).
         nmap_aggressive_interval: Seconds between aggressive scans (default 360).
@@ -85,6 +105,7 @@ class Scheduler:
         device_store,
         trust_engine:              TrustEngine  = None,
         learning_mode:             LearningMode = None,
+        alert_manager                          = None,
         scapy_interval:            int = 60,
         nmap_quick_interval:       int = 180,
         nmap_aggressive_interval:  int = 360,
@@ -95,6 +116,7 @@ class Scheduler:
         self.device_store               = device_store
         self._trust_engine              = trust_engine or TrustEngine()
         self._learning_mode             = learning_mode  # None = no learning mode
+        self._alert_manager             = alert_manager  # None = log-only, no dispatch
         self.scapy_interval             = scapy_interval
         self.nmap_quick_interval        = nmap_quick_interval
         self.nmap_aggressive_interval   = nmap_aggressive_interval
@@ -120,7 +142,8 @@ class Scheduler:
             f"nmap-quick={nmap_quick_interval}s  "
             f"nmap-aggressive={nmap_aggressive_interval}s  "
             f"workers={aggressive_workers}  "
-            f"learning_mode={'ON' if learning_mode else 'OFF'}"
+            f"learning_mode={'ON' if learning_mode else 'OFF'}  "
+            f"alert_manager={'ON' if alert_manager else 'OFF'}"
         )
 
     # ------------------------------------------------------------------
@@ -175,6 +198,7 @@ class Scheduler:
             "aggressive_workers":        self.aggressive_workers,
             "live_hosts_per_network":    live_counts,
             "active_threads":            [t.name for t in self._threads if t.is_alive()],
+            "alert_manager_active":      self._alert_manager is not None,
         }
 
     # ------------------------------------------------------------------
@@ -389,7 +413,14 @@ class Scheduler:
     def _run_trust_evaluation(self, network: str) -> None:
         """
         Pull current device list from store, run trust_engine on it,
-        log every alert-worthy verdict. Phase 3 alert_manager plugs in here.
+        log every alert-worthy verdict, hand the full verdict list to
+        alert_manager (if one was provided), and persist whichever
+        verdicts alert_manager actually fired (post-cooldown) to
+        device_store's alerts_log table.
+
+        Logging happens regardless of whether alert_manager is present —
+        this preserves the original Phase 2 behaviour exactly. The
+        alert_manager call and persistence step are purely additive.
         """
         try:
             all_devices = self.device_store.get_all()
@@ -417,8 +448,51 @@ class Scheduler:
                     logger.debug(
                         f"[trust] ✔ trusted — {v.display_name} | {v.ip}"
                     )
+
+            # --- Hand verdicts to alert_manager (cooldown + channel dispatch) ---
+            if self._alert_manager:
+                self._dispatch_and_persist_alerts(verdicts, network)
+
         except Exception as e:
             logger.error(f"[trust] Trust evaluation error: {e}")
+
+    def _dispatch_and_persist_alerts(
+        self, verdicts: List[DeviceVerdict], network: str
+    ) -> None:
+        """
+        Send verdicts to alert_manager, then persist whichever ones it
+        actually fired. Isolated into its own method (rather than inline
+        in _run_trust_evaluation) so a failure here — alert_manager
+        crashing, or a DB write failing — can never take down the scan
+        loop. Scanning must always continue even if alerting breaks.
+        """
+        try:
+            fired: List[DeviceVerdict] = self._alert_manager.process_verdicts(verdicts)
+        except Exception as e:
+            logger.error(f"[alert] process_verdicts failed: {e}")
+            return
+
+        if not fired:
+            return
+
+        logger.info(f"[alert] {len(fired)} alert(s) dispatched for {network} cycle.")
+
+        channel_count = len(getattr(self._alert_manager, "_channels", []))
+
+        for v in fired:
+            try:
+                self.device_store.log_alert(
+                    mac=v.mac,
+                    ip=v.ip,
+                    verdict=v.verdict.value,
+                    network=v.network or network,
+                    message_summary=f"{v.display_name} ({v.vendor or 'unknown vendor'})",
+                    channels_fired=channel_count,
+                )
+            except Exception as e:
+                # A logging failure must not be treated as a scan failure —
+                # log and move to the next fired verdict.
+                logger.error(f"[alert] Failed to persist alert for {v.mac}: {e}")
 
     def _route_to_store(
         self, devices: List[Dict], scanner: str, iface: str
