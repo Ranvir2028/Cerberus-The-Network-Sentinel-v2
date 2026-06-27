@@ -10,6 +10,15 @@ Rules:
 - Pure topology read: interfaces → IPs → networks → gateways.
 - Zero active interfaces (airplane mode) → returns [], never crashes.
 - Every downstream caller must treat [] as a normal, handleable state.
+
+Update (Phase 3 hardening): added interface-NAME-based virtual adapter
+filtering alongside the existing IP-prefix filtering. Docker Desktop's
+WSL2/Hyper-V virtual switch ("vEthernet (WSL)", "vEthernet (Default
+Switch)") doesn't reliably fall into any fixed IP range, so it could slip
+past the IP-prefix check and get scanned as if it were a real LAN
+segment — which is what produced a spurious "docker.internal" entry
+that looked like an unknown device. Filtering by interface name closes
+that gap regardless of whatever IP range Docker/WSL happens to assign.
 """
 
 import socket
@@ -68,6 +77,46 @@ def _is_loopback(interface: str, ip: str) -> bool:
     return False
 
 
+def _is_virtual_adapter(ip: str) -> bool:
+    """
+    Return True if this IP belongs to a known virtual adapter range.
+    VMware uses 192.168.153.x and 192.168.x.1 on host-only adapters.
+    VirtualBox uses 192.168.56.x by default.
+    These produce zero real LAN devices — skip them.
+    """
+    virtual_prefixes = (
+        "192.168.56.",   # VirtualBox host-only
+        "192.168.153.",  # VMware host-only (common default)
+        "192.168.99.",   # Docker Toolbox
+        "169.254.",      # APIPA / link-local — not a real network
+    )
+    return any(ip.startswith(p) for p in virtual_prefixes)
+
+
+def _is_virtual_interface_name(interface: str) -> bool:
+    """
+    Return True if the INTERFACE NAME itself identifies it as virtual,
+    regardless of its IP range. Docker Desktop's WSL2/Hyper-V virtual
+    switch doesn't reliably fall into any fixed IP range the way
+    VMware/VirtualBox host-only adapters do, so an IP-prefix check
+    alone misses it. This is what produced the "docker.internal"
+    entry that looked like an unknown LAN device — Cerberus was
+    scanning its own host's virtual switch, not a real device.
+    """
+    name_lower = interface.lower()
+    virtual_name_markers = (
+        "vethernet",         # Windows Hyper-V / WSL2 / Docker virtual switches
+        "docker",
+        "wsl",
+        "virtualbox",
+        "vmware",
+        "hyper-v",
+        "npcap loopback",
+        "loopback pseudo",
+    )
+    return any(marker in name_lower for marker in virtual_name_markers)
+
+
 # ---------------------------------------------------------------------------
 # Core detector
 # ---------------------------------------------------------------------------
@@ -98,7 +147,7 @@ class RouterDetector:
 
     def get_all_networks(self) -> List[Dict]:
         """
-        Return one dict per active non-loopback interface.
+        Return one dict per active non-loopback, non-virtual interface.
 
         Each dict:
             interface : str   — e.g. 'wlan0', 'eth0'
@@ -190,8 +239,13 @@ class RouterDetector:
     ) -> Optional[Dict]:
         """
         Extract IPv4 info from one interface.
-        Returns None for loopback, non-IPv4, or unaddressed interfaces.
+        Returns None for loopback, virtual, non-IPv4, or unaddressed
+        interfaces.
         """
+        if _is_virtual_interface_name(iface):
+            logger.debug(f"Skipping virtual interface by name: {iface}")
+            return None
+
         try:
             addrs = netifaces.ifaddresses(iface)
         except Exception as e:
@@ -207,6 +261,10 @@ class RouterDetector:
         netmask = addr_info.get("netmask", "255.255.255.0")
 
         if not ip or _is_loopback(iface, ip):
+            return None
+
+        if _is_virtual_adapter(ip):
+            logger.debug(f"Skipping virtual adapter by IP range: {iface} ({ip})")
             return None
 
         network_addr = _calculate_network_address(ip, netmask)
