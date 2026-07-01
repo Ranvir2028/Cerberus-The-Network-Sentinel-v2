@@ -273,7 +273,5 @@ class AlertManager:
                         f"[alert] Channel {channel.__qualname__} failed: {e}"
                     )
 
-        
-
         with self._lock:
             self._total_alerts_fired += 1
