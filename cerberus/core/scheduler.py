@@ -7,39 +7,48 @@ Three-tier scan coordinator per network:
   Tier 1 — Scapy ARP        every 60s   → fast device presence
   Tier 2 — Nmap quick       every 180s  → vendor/hostname refresh
   Tier 3 — Nmap aggressive  every 360s  → full OS/port/service fingerprint
-                                           threaded pool of 4 workers
-                                           targets ONLY live IPs from Scapy,
-                                           not blind subnet sweep
+
+Plus one GLOBAL (not per-network) tier:
+
+  mDNS discovery  every mdns_interval (default 120s) → hostname
+  enrichment via Bonjour/Zeroconf, independent of MAC.
 
 Lock model:
-  One threading.Lock per network CIDR. All three tiers acquire the same
-  lock before scanning, so no two scanners ever hit the same network
-  simultaneously. The aggressive tier holds the lock for longer — that's
-  intentional and correct, Scapy and quick-nmap simply wait their turn.
+  One threading.Lock per network CIDR. mDNS does not participate in
+  this lock — passive listener, writes via its own narrow DB method.
 
 Live-host cache:
   Scapy ARP results are stored in self._live_hosts[network] after every
-  sweep. Nmap quick and aggressive tiers read from this cache — they never
-  blindly sweep the whole /24. This is the Option B "smart targeting"
-  architecture: find who's alive cheaply with ARP, fingerprint only those.
+  sweep. Nmap quick and aggressive tiers read from this cache.
 
 MAC normalization:
-  Scapy returns lowercase MACs, Nmap returns uppercase. Both are lowercased
-  before being handed to device_store so no duplicate rows are created.
+  Scapy returns lowercase MACs, Nmap returns uppercase. Both lowercased
+  before being handed to device_store.
 
-Alert wiring (Phase 3, module 12):
-  Scheduler accepts an optional `alert_manager` instance. After every
-  trust evaluation, verdicts are handed to alert_manager.process_verdicts().
-  If no alert_manager is passed, behaviour is identical to before —
-  verdicts are logged locally only.
+Alert wiring + persistence (Phase 3, modules 12/13):
+  alert_manager.process_verdicts() returns the fired verdicts; scheduler
+  persists each to device_store.log_alert().
 
-Alert persistence (Phase 3, module 13 prep):
-  alert_manager.process_verdicts() now returns the list of verdicts it
-  actually fired (post-cooldown, post-dispatch). Scheduler — which
-  already holds the device_store reference — logs each fired verdict
-  to device_store.log_alert(). alert_manager itself never touches the
-  DB; this keeps that boundary intact while giving the system real,
-  persistent alert history for cerberus_service / CLI / API to read.
+Gateway hint wiring:
+  scheduler builds {network: gateway} from RouterDetector's output and
+  hands it to alert_manager.set_network_gateways().
+
+Vendor enrichment (this revision):
+  Nmap ships its own small internal MAC-vendor database, separate from
+  and much smaller than Cerberus's own VendorLookup (39k+ real IEEE OUI
+  entries — see detection/vendor_lookup.py). After every Nmap quick/
+  aggressive cycle, any device whose vendor Nmap couldn't identify gets
+  backfilled via device_store.update_vendor_if_missing() using
+  Cerberus's richer database. Never overwrites a vendor Nmap DID find.
+
+Learning-mode auto-start (bugfix, this revision):
+  Scheduler no longer decides whether learning mode auto-starts — that
+  responsibility moved to cerberus_main.py, which now checks
+  learning_mode.has_ever_started() before calling start(), fixing the
+  bug where restarting the scanner after a deliberate `learning stop`
+  would silently re-open a fresh 24h window. Scheduler only ever reads
+  learning_mode.is_active() during scan cycles — it never calls start()
+  itself, in this revision or any previous one.
 """
 
 import time
@@ -49,6 +58,8 @@ from typing import List, Dict, Set, Optional
 from concurrent.futures import ThreadPoolExecutor
 
 from cerberus.detection.router_detector import RouterDetector
+from cerberus.detection.mdns_discovery import MDNSDiscovery
+from cerberus.detection.vendor_lookup import VendorLookup
 from cerberus.core.scanner_scapy import ScapyScanner
 from cerberus.core.scanner_nmap import NmapScanner
 from cerberus.intelligence.trust_engine import TrustEngine, TrustVerdict, DeviceVerdict
@@ -82,22 +93,7 @@ class _NetworkLockRegistry:
 
 class Scheduler:
     """
-    Three-tier scan coordinator.
-
-    Args:
-        device_store         : Any object with upsert(dict) method, plus
-                                log_alert() for alert history persistence.
-        trust_engine          : TrustEngine instance (created internally if None).
-        learning_mode          : LearningMode instance, or None to disable.
-        alert_manager           : AlertManager instance, or None to disable
-                                   alert dispatch entirely (verdicts still
-                                   get logged locally either way).
-        scapy_interval       : Seconds between ARP sweeps (default 60).
-        nmap_quick_interval  : Seconds between quick Nmap sweeps (default 180).
-        nmap_aggressive_interval: Seconds between aggressive scans (default 360).
-        aggressive_workers   : Thread pool size for aggressive scans (default 4).
-        network_retry_wait   : Seconds to wait if no interfaces found (default 30).
-        scapy_timeout        : ARP reply timeout in seconds (default 3).
+    Three-tier (per-network) + one global (mDNS) scan coordinator.
     """
 
     def __init__(
@@ -112,20 +108,28 @@ class Scheduler:
         aggressive_workers:        int = 4,
         network_retry_wait:        int = 30,
         scapy_timeout:             int = 3,
+        mdns_enabled:              bool = True,
+        mdns_interval:             int = 120,
     ):
         self.device_store               = device_store
         self._trust_engine              = trust_engine or TrustEngine()
-        self._learning_mode             = learning_mode  # None = no learning mode
-        self._alert_manager             = alert_manager  # None = log-only, no dispatch
+        self._learning_mode             = learning_mode
+        self._alert_manager             = alert_manager
         self.scapy_interval             = scapy_interval
         self.nmap_quick_interval        = nmap_quick_interval
         self.nmap_aggressive_interval   = nmap_aggressive_interval
         self.aggressive_workers         = aggressive_workers
         self.network_retry_wait         = network_retry_wait
+        self.mdns_interval              = mdns_interval
 
         # Scanners — stateless, one instance each, reused per call
         self._scapy = ScapyScanner(timeout=scapy_timeout, wake_up_ping=True)
         self._nmap  = NmapScanner()
+        self._mdns  = MDNSDiscovery(timeout=5) if mdns_enabled else None
+
+        # Used ONLY for vendor-enrichment backfill (update_vendor_if_missing).
+        # Never used for trust decisions here — that stays in trust_engine.
+        self._vendor_lookup = VendorLookup()
 
         # Live-host cache: network → set of IP strings from last Scapy sweep
         self._live_hosts: Dict[str, Set[str]] = {}
@@ -143,7 +147,8 @@ class Scheduler:
             f"nmap-aggressive={nmap_aggressive_interval}s  "
             f"workers={aggressive_workers}  "
             f"learning_mode={'ON' if learning_mode else 'OFF'}  "
-            f"alert_manager={'ON' if alert_manager else 'OFF'}"
+            f"alert_manager={'ON' if alert_manager else 'OFF'}  "
+            f"mdns={'ON every ' + str(mdns_interval) + 's' if mdns_enabled else 'OFF'}"
         )
 
     # ------------------------------------------------------------------
@@ -159,6 +164,7 @@ class Scheduler:
             logger.critical("No networks found — scheduler cannot start.")
             return
 
+        self._configure_alert_gateways()
         self._spawn_workers()
 
         if blocking:
@@ -192,6 +198,7 @@ class Scheduler:
         return {
             "running":                   self.is_running,
             "networks":                  [n["network"] for n in self._networks],
+            "network_gateways":          {n["network"]: n.get("gateway", "") for n in self._networks},
             "scapy_interval":            self.scapy_interval,
             "nmap_quick_interval":       self.nmap_quick_interval,
             "nmap_aggressive_interval":  self.nmap_aggressive_interval,
@@ -199,6 +206,8 @@ class Scheduler:
             "live_hosts_per_network":    live_counts,
             "active_threads":            [t.name for t in self._threads if t.is_alive()],
             "alert_manager_active":      self._alert_manager is not None,
+            "mdns_enabled":              self._mdns is not None,
+            "mdns_interval":             self.mdns_interval,
         }
 
     # ------------------------------------------------------------------
@@ -221,8 +230,22 @@ class Scheduler:
             time.sleep(self.network_retry_wait)
         return []
 
+    def _configure_alert_gateways(self) -> None:
+        if not self._alert_manager:
+            return
+        gateways = {
+            n["network"]: n["gateway"]
+            for n in self._networks
+            if n.get("gateway")
+        }
+        if gateways:
+            self._alert_manager.set_network_gateways(gateways)
+            logger.info(f"Alert gateway hints configured: {gateways}")
+        else:
+            logger.debug("No gateways detected — block-hint will be omitted from alerts.")
+
     # ------------------------------------------------------------------
-    # Worker spawning — 3 threads per network
+    # Worker spawning
     # ------------------------------------------------------------------
 
     def _spawn_workers(self) -> None:
@@ -230,7 +253,6 @@ class Scheduler:
             network = net_info["network"]
             iface   = net_info["interface"]
 
-            # Initialise live-host cache for this network
             with self._live_hosts_lock:
                 self._live_hosts[network] = set()
 
@@ -264,16 +286,21 @@ class Scheduler:
                 f"[scapy / nmap-quick / nmap-aggressive]"
             )
 
+        if self._mdns:
+            t = threading.Thread(
+                target=self._mdns_worker,
+                name="mdns-discovery",
+                daemon=True,
+            )
+            self._threads.append(t)
+            t.start()
+            logger.info(f"mDNS discovery worker started — every {self.mdns_interval}s")
+
     # ------------------------------------------------------------------
-    # Worker loops
+    # Worker loops — per-network tiers
     # ------------------------------------------------------------------
 
     def _scapy_worker(self, network: str, iface: str) -> None:
-        """
-        Tier 1 — ARP sweep every scapy_interval seconds.
-        Updates the live-host cache after every sweep so the Nmap workers
-        always target current, confirmed-alive IPs.
-        """
         logger.info(f"[scapy] Started → {network}")
 
         while not self._stop_event.is_set():
@@ -283,28 +310,26 @@ class Scheduler:
                 devices = self._scapy.scan(network)
 
             if devices:
-                # Normalize MACs before storing
                 for d in devices:
                     if d.get("mac"):
                         d["mac"] = d["mac"].lower()
 
-                # Update live-host cache
                 live_ips = {d["ip"] for d in devices}
                 with self._live_hosts_lock:
                     self._live_hosts[network] = live_ips
 
                 self._route_to_store(devices, scanner="scapy", iface=iface)
+                self._enrich_vendors(devices)
+
                 logger.info(
                     f"[scapy] {network} → {len(devices)} device(s) | "
                     f"live: {sorted(live_ips)}"
                 )
 
-                # --- Learning mode: auto-trust during baseline window ---
                 if self._learning_mode and self._learning_mode.is_active():
                     all_devices = self.device_store.get_all()
                     self._learning_mode.auto_trust_all(all_devices)
 
-                # --- Trust engine: evaluate verdicts every cycle ---
                 self._run_trust_evaluation(network)
 
             else:
@@ -315,12 +340,6 @@ class Scheduler:
         logger.info(f"[scapy] Exiting → {network}")
 
     def _nmap_quick_worker(self, network: str, iface: str) -> None:
-        """
-        Tier 2 — Quick ping sweep every nmap_quick_interval seconds.
-        Updates vendor and hostname fields. Runs on live IPs only.
-        Sleeps for one full quick interval on startup so Scapy always
-        populates the live-host cache before Nmap reads it.
-        """
         logger.info(
             f"[nmap-quick] Started → {network} | "
             f"first scan in {self.nmap_quick_interval}s"
@@ -334,16 +353,14 @@ class Scheduler:
                 lock = self._locks.get(network)
                 with lock:
                     logger.debug(f"[nmap-quick] Scanning {len(live_ips)} host(s) on {network}")
-                    # Pass space-separated IPs to Nmap — it accepts this fine.
-                    # Then force 'network' field to the CIDR so device_store
-                    # never sees "192.168.1.1 192.168.1.5" as the network value.
                     targets = " ".join(sorted(live_ips))
                     devices = self._nmap.scan_quick(targets)
 
                 if devices:
                     for d in devices:
-                        d["network"] = network  # always overwrite with real CIDR
+                        d["network"] = network
                     self._route_to_store(devices, scanner="nmap_quick", iface=iface)
+                    self._enrich_vendors(devices)
                     logger.info(
                         f"[nmap-quick] {network} → {len(devices)} device(s) updated"
                     )
@@ -357,14 +374,6 @@ class Scheduler:
         logger.info(f"[nmap-quick] Exiting → {network}")
 
     def _nmap_aggressive_worker(self, network: str, iface: str) -> None:
-        """
-        Tier 3 — Full aggressive fingerprint every nmap_aggressive_interval.
-        Targets only confirmed-alive IPs from Scapy cache.
-        Uses a thread pool (aggressive_workers) to scan multiple hosts
-        in parallel — one thread per host, up to the pool limit.
-        Starts after one full aggressive interval so Scapy and quick-nmap
-        both run first and populate the cache.
-        """
         logger.info(
             f"[nmap-aggressive] Started → {network} | "
             f"first scan in {self.nmap_aggressive_interval}s"
@@ -389,10 +398,11 @@ class Scheduler:
 
                 if devices:
                     for d in devices:
-                        d["network"] = network  # always overwrite with real CIDR
+                        d["network"] = network
                     self._route_to_store(
                         devices, scanner="nmap_aggressive", iface=iface
                     )
+                    self._enrich_vendors(devices)
                     logger.info(
                         f"[nmap-aggressive] {network} → "
                         f"{len(devices)} host(s) fully fingerprinted"
@@ -407,21 +417,78 @@ class Scheduler:
         logger.info(f"[nmap-aggressive] Exiting → {network}")
 
     # ------------------------------------------------------------------
-    # Storage routing
+    # Worker loop — global mDNS tier
+    # ------------------------------------------------------------------
+
+    def _mdns_worker(self) -> None:
+        logger.info("[mdns] Started")
+        self._interruptible_sleep(10)
+
+        while not self._stop_event.is_set():
+            try:
+                results = self._mdns.discover()
+            except Exception as e:
+                logger.error(f"[mdns] discover() failed: {e}")
+                results = []
+
+            updated = 0
+            for r in results:
+                try:
+                    if self.device_store.update_hostname_from_mdns(r["ip"], r["hostname"]):
+                        updated += 1
+                except Exception as e:
+                    logger.error(f"[mdns] Failed to apply hostname for {r.get('ip')}: {e}")
+
+            if updated:
+                logger.info(f"[mdns] Enriched {updated} device(s) with mDNS hostnames.")
+            else:
+                logger.debug("[mdns] No new hostnames to apply this cycle.")
+
+            self._interruptible_sleep(self.mdns_interval)
+
+        logger.info("[mdns] Exiting")
+
+    # ------------------------------------------------------------------
+    # Vendor enrichment (this revision)
+    # ------------------------------------------------------------------
+
+    def _enrich_vendors(self, devices: List[Dict]) -> None:
+        """
+        For any device in this batch whose vendor is missing/empty,
+        look it up against Cerberus's own richer OUI database and
+        backfill it. device_store.update_vendor_if_missing() already
+        guards against overwriting a vendor Nmap found — this method
+        just decides WHICH devices are worth checking (only ones
+        lacking a vendor in the batch we just scanned), same
+        cheap-guard pattern the mDNS worker uses.
+        """
+        enriched = 0
+        for d in devices:
+            mac = d.get("mac")
+            if not mac:
+                continue
+            # Only bother looking up if THIS scan result didn't already
+            # carry a vendor — avoids a wasted lookup for the common case
+            # where Nmap/Scapy already knows it.
+            if d.get("vendor"):
+                continue
+            looked_up = self._vendor_lookup.lookup(mac)
+            if not looked_up:
+                continue
+            try:
+                if self.device_store.update_vendor_if_missing(mac, looked_up):
+                    enriched += 1
+            except Exception as e:
+                logger.error(f"[vendor-enrich] Failed for {mac}: {e}")
+
+        if enriched:
+            logger.debug(f"[vendor-enrich] Backfilled vendor for {enriched} device(s).")
+
+    # ------------------------------------------------------------------
+    # Storage routing — trust + alerts
     # ------------------------------------------------------------------
 
     def _run_trust_evaluation(self, network: str) -> None:
-        """
-        Pull current device list from store, run trust_engine on it,
-        log every alert-worthy verdict, hand the full verdict list to
-        alert_manager (if one was provided), and persist whichever
-        verdicts alert_manager actually fired (post-cooldown) to
-        device_store's alerts_log table.
-
-        Logging happens regardless of whether alert_manager is present —
-        this preserves the original Phase 2 behaviour exactly. The
-        alert_manager call and persistence step are purely additive.
-        """
         try:
             all_devices = self.device_store.get_all()
             if not all_devices:
@@ -443,13 +510,11 @@ class Scheduler:
                         f"[trust] ↩ RETURNING UNKNOWN — "
                         f"{v.display_name} | {v.ip} | {v.mac}{rand_tag}"
                     )
-                # TRUSTED verdicts logged at DEBUG only — not noise in normal ops
                 else:
                     logger.debug(
                         f"[trust] ✔ trusted — {v.display_name} | {v.ip}"
                     )
 
-            # --- Hand verdicts to alert_manager (cooldown + channel dispatch) ---
             if self._alert_manager:
                 self._dispatch_and_persist_alerts(verdicts, network)
 
@@ -459,13 +524,6 @@ class Scheduler:
     def _dispatch_and_persist_alerts(
         self, verdicts: List[DeviceVerdict], network: str
     ) -> None:
-        """
-        Send verdicts to alert_manager, then persist whichever ones it
-        actually fired. Isolated into its own method (rather than inline
-        in _run_trust_evaluation) so a failure here — alert_manager
-        crashing, or a DB write failing — can never take down the scan
-        loop. Scanning must always continue even if alerting breaks.
-        """
         try:
             fired: List[DeviceVerdict] = self._alert_manager.process_verdicts(verdicts)
         except Exception as e:
@@ -490,14 +548,11 @@ class Scheduler:
                     channels_fired=channel_count,
                 )
             except Exception as e:
-                # A logging failure must not be treated as a scan failure —
-                # log and move to the next fired verdict.
                 logger.error(f"[alert] Failed to persist alert for {v.mac}: {e}")
 
     def _route_to_store(
         self, devices: List[Dict], scanner: str, iface: str
     ) -> None:
-        """Hand each device to device_store.upsert(). Never stores anything itself."""
         for device in devices:
             record = {**device, "scanner": scanner, "interface": iface}
             try:
@@ -513,12 +568,10 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     def _get_live_ips(self, network: str) -> Set[str]:
-        """Thread-safe read of the live-host cache for one network."""
         with self._live_hosts_lock:
             return set(self._live_hosts.get(network, set()))
 
     def _interruptible_sleep(self, seconds: int) -> None:
-        """Sleep in 1s ticks — responds to stop_event within 1 second."""
         for _ in range(seconds):
             if self._stop_event.is_set():
                 return
