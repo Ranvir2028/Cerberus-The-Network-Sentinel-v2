@@ -43,6 +43,7 @@ from cerberus.alerts.alert_manager import AlertManager
 from cerberus.alerts.email_alert import EmailAlert
 from cerberus.service.cerberus_service import CerberusService
 from cerberus.api.server import run_server
+from cerberus.utils.npcap_installer import handle_npcap_installation
 
 
 def _parse_args() -> argparse.Namespace:
@@ -232,6 +233,12 @@ def main() -> None:
     mdns_will_run = cfg.mdns_enabled and not args.no_mdns
 
     _print_banner(logger)
+    
+    # Npcap check — Windows-only, no-ops cleanly on Linux/macOS
+    if not handle_npcap_installation():
+        logger.critical("Npcap unavailable and required for scanning. Exiting.")
+        sys.exit(1)
+
     logger.info(f"DB                  : {db_path}")
     logger.info(f"Config file         : {args.config or 'config/config.json'}")
     logger.info(f"Scapy interval      : {scapy_interval}s")

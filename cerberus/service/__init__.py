@@ -1,0 +1,1 @@
+"""The seam — CLI and API both call only this."""
