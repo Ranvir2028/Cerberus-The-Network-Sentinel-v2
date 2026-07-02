@@ -1,0 +1,8 @@
+netifaces-plus
+scapy
+python-nmap
+colorama
+python-dotenv
+Flask
+flask-cors
+zeroconf

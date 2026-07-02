@@ -1,0 +1,531 @@
+/* ============================================================
+   Cerberus Dashboard — HUD / Targeting-Display Identity
+   ------------------------------------------------------------
+   Direction: engineering weapons-display, not "holographic AI
+   assistant blue glow" (that's its own cliché now). Signal reads
+   as two instruments, not one neon accent: arc-reactor cyan for
+   live/trusted state, molten copper for warnings/attention, hot
+   coral only for active threats. Panels are angular (clipped
+   corners, reticle brackets) instead of soft rounded cards.
+   Background carries a faint schematic grid, not flat void.
+   ============================================================ */
+
+:root {
+  /* Color */
+  --bg:            #080B10;
+  --bg-grid:       rgba(63, 224, 232, 0.035);
+  --surface:       #0E141C;
+  --surface-raised:#141C26;
+  --line:          #1C2733;
+  --line-bright:   #2E4152;
+  --text:          #D7E1EA;
+  --text-muted:    #7C8A9A;
+  --text-faint:    #4A5866;
+
+  --cyan:          #3FE0E8;   /* arc-reactor — live, trusted, primary signal */
+  --cyan-dim:      rgba(63, 224, 232, 0.10);
+  --cyan-line:     rgba(63, 224, 232, 0.35);
+
+  --copper:        #E0913F;   /* molten copper — attention, learning mode */
+  --copper-dim:    rgba(224, 145, 63, 0.12);
+
+  --threat:        #FF5D4A;   /* hot coral — untrusted / active alert only */
+  --threat-dim:    rgba(255, 93, 74, 0.12);
+
+  --mint:          #3FE0A8;   /* secondary confirm tone, used sparingly */
+
+  /* Type */
+  --font-display: 'Orbitron', sans-serif;   /* wordmark ONLY — restraint */
+  --font-hud:     'Rajdhani', sans-serif;   /* labels, headers, UI chrome */
+  --font-mono:    'JetBrains Mono', monospace; /* raw telemetry: MAC/IP/time */
+
+  --radius-cut: 14px; /* corner clip size, not border-radius */
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-hud);
+  -webkit-font-smoothing: antialiased;
+}
+
+#root { min-height: 100vh; position: relative; }
+
+/* Schematic grid backdrop — faint, engineering-blueprint feel */
+#root::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image:
+    linear-gradient(var(--bg-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px);
+  background-size: 42px 42px;
+  mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, black 40%, transparent 90%);
+}
+
+a { color: inherit; }
+button { font-family: var(--font-hud); cursor: pointer; }
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* Angular clipped-corner panel shape — the core visual signature.
+   Applied via clip-path so it works on any panel without extra markup. */
+.panel,
+.stat-card {
+  clip-path: polygon(
+    0 0, calc(100% - var(--radius-cut)) 0, 100% var(--radius-cut),
+    100% 100%, var(--radius-cut) 100%, 0 calc(100% - var(--radius-cut))
+  );
+  position: relative;
+}
+
+/* Corner reticle brackets — the signature detail, restrained to
+   the two "live" corners of each panel so it reads as targeting
+   hardware, not decoration smeared everywhere. */
+.panel::after {
+  content: '';
+  position: absolute;
+  top: 0; left: 0;
+  width: 16px; height: 16px;
+  border-top: 2px solid var(--cyan-line);
+  border-left: 2px solid var(--cyan-line);
+  pointer-events: none;
+}
+
+/* ------------------------------------------------------------
+   Layout shell
+   ------------------------------------------------------------ */
+
+.app {
+  position: relative;
+  z-index: 1;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 28px 20px 60px;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 22px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.brand-mark {
+  width: 46px;
+  height: 46px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  filter: drop-shadow(0 0 6px rgba(63, 224, 232, 0.35));
+}
+
+.brand-name {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 20px;
+  letter-spacing: 1.5px;
+  color: var(--text);
+  text-transform: uppercase;
+}
+
+.brand-sub {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  margin-top: 2px;
+}
+
+.conn-pill {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 8px 16px 8px 12px;
+  border: 1px solid var(--line-bright);
+  white-space: nowrap;
+  clip-path: polygon(10px 0, 100% 0, 100% 100%, 0 100%, 0 10px);
+}
+
+/* Radar-sweep status indicator — replaces the plain pulsing dot.
+   A rotating conic gradient inside a ring reads as an active scan
+   sweep, not a generic "online" light. */
+.radar {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--cyan-line);
+  position: relative;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.radar.live::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: conic-gradient(from 0deg, var(--cyan), transparent 70%);
+  animation: sweep 2.2s linear infinite;
+}
+
+.radar.down {
+  border-color: var(--threat);
+}
+.radar.down::before {
+  content: '';
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--threat);
+}
+
+@keyframes sweep {
+  to { transform: rotate(360deg); }
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot.live { background: var(--copper); box-shadow: 0 0 8px 1px rgba(224, 145, 63, 0.6); }
+
+/* ------------------------------------------------------------
+   Stat row
+   ------------------------------------------------------------ */
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  margin-bottom: 22px;
+}
+
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  padding: 16px 18px;
+}
+
+.stat-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-faint);
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+
+.stat-value {
+  font-family: var(--font-mono);
+  font-size: 30px;
+  font-weight: 500;
+  line-height: 1;
+  color: var(--text);
+}
+
+.stat-value.alert-color { color: var(--threat); }
+.stat-value.trust-color { color: var(--cyan); }
+
+/* ------------------------------------------------------------
+   Main grid
+   ------------------------------------------------------------ */
+
+.main-grid {
+  display: grid;
+  grid-template-columns: 1fr 330px;
+  gap: 18px;
+  align-items: start;
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 15px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.panel-title {
+  font-family: var(--font-hud);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text);
+}
+
+.panel-title::before {
+  content: '// ';
+  color: var(--cyan);
+  font-family: var(--font-mono);
+  font-weight: 400;
+}
+
+.panel-body { padding: 0; }
+.panel-body.padded { padding: 18px; }
+
+/* ------------------------------------------------------------
+   Device table
+   ------------------------------------------------------------ */
+
+.filter-tabs { display: flex; gap: 2px; }
+
+.filter-tab {
+  background: transparent;
+  border: 1px solid var(--line-bright);
+  color: var(--text-muted);
+  padding: 6px 14px;
+  font-size: 12px;
+  font-family: var(--font-hud);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  clip-path: polygon(6px 0, 100% 0, 100% 100%, 0 100%, 0 6px);
+}
+
+.filter-tab.active {
+  border-color: var(--copper);
+  color: var(--copper);
+  background: var(--copper-dim);
+}
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+
+thead th {
+  text-align: left;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+  padding: 11px 18px;
+  border-bottom: 1px solid var(--line);
+  font-weight: 600;
+}
+
+tbody td {
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: var(--surface-raised); }
+
+.device-name {
+  font-weight: 600;
+  margin-bottom: 3px;
+  display: flex;
+  align-items: center;
+  font-family: var(--font-hud);
+  font-size: 14px;
+}
+
+.device-sub {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.mono { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); }
+
+.trust-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  font-family: var(--font-mono);
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 4px 11px;
+  border: 1px solid transparent;
+  clip-path: polygon(6px 0, 100% 0, 100% 100%, 0 100%, 0 6px);
+}
+
+.trust-badge.trusted { background: var(--cyan-dim); color: var(--cyan); border-color: var(--cyan-line); }
+.trust-badge.untrusted { background: var(--threat-dim); color: var(--threat); border-color: rgba(255,93,74,0.35); }
+
+.row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+
+.icon-btn {
+  background: transparent;
+  border: 1px solid var(--line-bright);
+  color: var(--text-muted);
+  padding: 6px 12px;
+  font-size: 11px;
+  font-family: var(--font-hud);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+  clip-path: polygon(5px 0, 100% 0, 100% 100%, 0 100%, 0 5px);
+}
+
+.icon-btn:hover { border-color: var(--text-muted); color: var(--text); }
+.icon-btn.danger:hover { border-color: var(--threat); color: var(--threat); background: var(--threat-dim); }
+.icon-btn.safe:hover { border-color: var(--cyan); color: var(--cyan); background: var(--cyan-dim); }
+
+/* Per-row live indicator — small HUD tick, not a soft pulsing dot */
+.pulse-dot {
+  width: 3px;
+  height: 13px;
+  background: var(--cyan);
+  box-shadow: 0 0 6px 0 var(--cyan-line);
+  display: inline-block;
+  margin-right: 10px;
+  animation: tick 2.4s ease-in-out infinite;
+}
+
+@keyframes tick {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.empty-state {
+  padding: 44px 20px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 13px;
+  font-family: var(--font-mono);
+}
+
+/* ------------------------------------------------------------
+   Side panel — alerts + learning mode
+   ------------------------------------------------------------ */
+
+.alert-item { padding: 13px 18px; border-bottom: 1px solid var(--line); font-size: 12px; }
+.alert-item:last-child { border-bottom: none; }
+
+.alert-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 5px;
+}
+
+.alert-verdict {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--threat);
+  letter-spacing: 0.06em;
+}
+
+.alert-time { font-family: var(--font-mono); font-size: 10px; color: var(--text-faint); }
+.alert-summary { color: var(--text-muted); font-family: var(--font-mono); font-size: 11.5px; }
+
+.learning-box { padding: 18px; }
+
+.learning-status-line {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.learning-status-line .dot.learning {
+  background: var(--copper);
+  box-shadow: 0 0 8px 1px rgba(224, 145, 63, 0.6);
+  animation: tick 2s ease-in-out infinite;
+}
+
+.learning-remaining {
+  font-family: var(--font-mono);
+  font-size: 24px;
+  font-weight: 500;
+  color: var(--copper);
+  margin-bottom: 14px;
+  letter-spacing: 0.02em;
+}
+
+.btn {
+  width: 100%;
+  padding: 11px 14px;
+  border: 1px solid var(--line-bright);
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-family: var(--font-hud);
+  margin-bottom: 9px;
+  transition: border-color 0.15s, background 0.15s;
+  clip-path: polygon(8px 0, 100% 0, 100% 100%, 0 100%, 0 8px);
+}
+
+.btn:hover { border-color: var(--text-muted); }
+.btn.primary { border-color: var(--copper); color: var(--copper); }
+.btn.primary:hover { background: var(--copper-dim); }
+.btn.stop { border-color: var(--threat); color: var(--threat); }
+.btn.stop:hover { background: var(--threat-dim); }
+
+.hint-text {
+  font-size: 11px;
+  color: var(--text-faint);
+  line-height: 1.6;
+  margin-top: 4px;
+  font-family: var(--font-mono);
+}
+
+/* ------------------------------------------------------------
+   Responsive
+   ------------------------------------------------------------ */
+
+@media (max-width: 860px) {
+  .main-grid { grid-template-columns: 1fr; }
+  .stats { grid-template-columns: repeat(2, 1fr); }
+}
+
+@media (max-width: 520px) {
+  .app { padding: 18px 12px 40px; }
+  .brand-sub { display: none; }
+  table { font-size: 12px; }
+  thead th:nth-child(3), tbody td:nth-child(3) { display: none; }
+  .row-actions { flex-direction: column; }
+  .brand-name { font-size: 16px; }
+}
