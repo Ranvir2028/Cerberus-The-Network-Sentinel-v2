@@ -16,7 +16,10 @@ Design decision — embedded, not standalone:
 Auth:
   If CERBERUS_API_SECRET is set, every /api/* request must include
   header: X-API-Key: <the secret>. /api/health is intentionally
-  unauthenticated (basic liveness check).
+  unauthenticated (basic liveness check). /confirm/trust/<token> is
+  ALSO intentionally unauthenticated (see below) — the token itself is
+  the credential, not the X-API-Key header, since these links are
+  opened from an email client, not the dashboard.
 
 CORS (added this revision):
   Module 16's React frontend will run on its own dev server (different
@@ -28,12 +31,36 @@ CORS (added this revision):
   any origin for now since this is a single-operator LAN tool; tighten
   to a specific origin if this is ever exposed beyond a trusted network.
 
+Email Trust confirmation (this revision):
+  GET  /confirm/trust/<token>  — renders a styled HTML confirmation
+    page. NO side effects — calls service.verify_trust_token() only,
+    which never marks a token used or trusts a device. This
+    distinction matters specifically because some email providers and
+    corporate security gateways pre-fetch/scan links in emails before
+    a human ever opens them; if GET performed the trust action, that
+    prefetching would silently trust devices without the operator
+    ever clicking anything. The page requires an actual button click
+    (a real POST, triggered by the browser submitting a form) before
+    anything changes.
+  POST /confirm/trust/<token>  — the only route that actually calls
+    service.redeem_trust_token(), which is atomic against double-
+    submission (device_store.mark_token_used()'s UNIQUE constraint on
+    token_id guarantees only one concurrent request can ever succeed).
+  Both routes are unauthenticated by design (no X-API-Key required) —
+  the signed token IS the authentication, exactly like a password-
+  reset email link from any other service. Rejecting bad/expired/
+  reused tokens is verify_trust_token()/redeem_trust_token()'s job in
+  cerberus_service.py, not this file's.
+
 Rules:
   - Every route is a thin dispatch into a CerberusService instance
     passed in at construction time. No business logic here.
   - Never imports storage/intelligence/alerts directly — only the seam.
-  - All responses are JSON. Errors return {"error": "..."} with an
-    appropriate HTTP status code, never a raw stack trace to the client.
+  - All JSON API responses use {"error": "..."} with an appropriate
+    HTTP status code, never a raw stack trace to the client. The two
+    /confirm/trust/<token> routes return styled HTML pages instead of
+    JSON, since they're meant to be opened directly in a browser from
+    an email link, not consumed by the dashboard's fetch() calls.
 """
 
 import logging
@@ -59,15 +86,21 @@ def create_app(service: CerberusService, api_secret: Optional[str] = None) -> Fl
         api_secret : Value of CERBERUS_API_SECRET. None/"" = no auth
                      enforced (matches config_loader's existing warning
                      behaviour rather than silently blocking everything).
+                     Does NOT apply to /confirm/trust/<token> — those
+                     routes are protected by the signed token itself,
+                     not this secret (an email link can't carry a
+                     dashboard API key, and shouldn't need to).
 
     Returns:
         Flask app, ready to run with app.run(...) or any WSGI server.
     """
     app = Flask("cerberus_api")
 
-    # CORS scoped to /api/* — the only routes that exist anyway, but
-    # explicit is better than accidentally wide-opening something else
-    # added later without thinking about it.
+    # CORS scoped to /api/* — the only JSON routes that exist anyway,
+    # but explicit is better than accidentally wide-opening something
+    # else added later without thinking about it. /confirm/trust/<token>
+    # is a plain browser navigation (not a fetch() call from the
+    # frontend), so it doesn't need CORS headers at all.
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
     # ------------------------------------------------------------------
@@ -266,6 +299,33 @@ def create_app(service: CerberusService, api_secret: Optional[str] = None) -> Fl
         """Unauthenticated on purpose — basic liveness check."""
         return jsonify({"status": "ok"})
 
+    # ------------------------------------------------------------------
+    # Email Trust confirmation (this revision) — NOT under /api/*,
+    # deliberately outside the X-API-Key requirement, meant to be
+    # opened directly in a browser from an alert email's link.
+    # ------------------------------------------------------------------
+
+    @app.route("/confirm/trust/<token>", methods=["GET"])
+    def confirm_trust_page(token: str):
+        """
+        Renders the confirmation page. NO side effects — see module
+        docstring for why GET must never redeem the token itself.
+        """
+        check = service.verify_trust_token(token)
+        html = _render_confirm_page(token, check)
+        return html
+
+    @app.route("/confirm/trust/<token>", methods=["POST"])
+    def confirm_trust_submit(token: str):
+        """
+        The actual action — only reachable via the confirmation page's
+        own form submission (a real click), never via the bare email
+        link (which is a GET).
+        """
+        result = service.redeem_trust_token(token)
+        html = _render_result_page(result)
+        return html
+
     return app
 
 
@@ -289,6 +349,151 @@ def run_server(
     # use_reloader=False is mandatory — Flask's reloader spawns a SECOND
     # process and would duplicate the embedded scheduler thread.
     app.run(host=host, port=port, debug=False, use_reloader=False)
+
+
+# ---------------------------------------------------------------------------
+# Private — HTML rendering for the Trust confirmation pages
+#
+# Self-contained (a real <style> block is fine here, unlike the email
+# HTML in alert_manager.py — this is a normal web page opened in a
+# browser, not an email client that strips <style> tags). Matches the
+# dashboard's cyan/copper/coral HUD palette so the confirmation flow
+# doesn't feel like a jarring detour from the rest of the product.
+# ---------------------------------------------------------------------------
+
+_PAGE_SHELL = """\
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cerberus — Trust Confirmation</title>
+<style>
+  body {{
+    margin: 0; padding: 0; min-height: 100vh;
+    background: #080B10; color: #D7E1EA;
+    font-family: -apple-system, 'Segoe UI', Arial, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+  }}
+  .card {{
+    background: #0E141C; border: 1px solid #1C2733;
+    max-width: 460px; width: calc(100% - 40px); margin: 20px;
+    padding: 32px;
+  }}
+  .eyebrow {{
+    color: #3FE0E8; font-family: monospace; font-size: 11px;
+    letter-spacing: 0.15em; text-transform: uppercase; margin: 0 0 20px;
+  }}
+  h1 {{ font-size: 18px; margin: 0 0 16px; letter-spacing: 0.02em; }}
+  p {{ font-size: 14px; line-height: 1.6; color: #7C8A9A; margin: 0 0 16px; }}
+  table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; }}
+  td {{ padding: 4px 0; font-size: 13px; }}
+  td.label {{ color: #7C8A9A; width: 110px; }}
+  td.value {{ color: #D7E1EA; font-family: monospace; }}
+  button {{
+    width: 100%; padding: 13px; border: none; cursor: pointer;
+    font-weight: 700; font-size: 13px; letter-spacing: 0.05em;
+    text-transform: uppercase; border-radius: 2px;
+  }}
+  .btn-confirm {{ background: #3FE0E8; color: #080B10; }}
+  .status-ok {{ color: #3FE0E8; }}
+  .status-warn {{ color: #E0913F; }}
+  .status-error {{ color: #FF5D4A; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <p class="eyebrow">// Cerberus — Network Sentinel</p>
+    {content}
+  </div>
+</body>
+</html>"""
+
+
+def _render_confirm_page(token: str, check: dict) -> str:
+    if not check["valid"]:
+        reason = check["reason"]
+        messages = {
+            "unavailable": ("status-error", "Trust links are not enabled",
+                             "This Cerberus instance has no link-signing secret configured."),
+            "malformed": ("status-error", "Invalid link",
+                          "This link is malformed and cannot be used."),
+            "bad_signature": ("status-error", "Invalid link",
+                               "This link's signature does not match — it may have been altered."),
+            "expired": ("status-warn", "Link expired",
+                        "This Trust link has expired. Open the Cerberus dashboard "
+                        "to trust this device manually instead."),
+        }
+        cls, title, body = messages.get(
+            reason, ("status-error", "Invalid link", "This link could not be verified.")
+        )
+        content = f'<h1 class="{cls}">{title}</h1><p>{body}</p>'
+        return _PAGE_SHELL.format(content=content)
+
+    device = check["device"]
+    mac = check["mac"]
+    display_name = (
+        (device.get("label") or device.get("hostname") or device.get("vendor") or mac)
+        if device else mac
+    )
+
+    if check["already_used"]:
+        content = (
+            '<h1 class="status-warn">Already confirmed</h1>'
+            f'<p>This link has already been used. <strong>{display_name}</strong> '
+            'should already be marked trusted — check the dashboard to confirm.</p>'
+        )
+        return _PAGE_SHELL.format(content=content)
+
+    if not device:
+        content = (
+            '<h1 class="status-error">Device not found</h1>'
+            f'<p>The device for MAC <code>{mac}</code> is no longer in Cerberus\'s '
+            'records — it may have been removed.</p>'
+        )
+        return _PAGE_SHELL.format(content=content)
+
+    rows = "".join([
+        f'<tr><td class="label">Name</td><td class="value">{display_name}</td></tr>',
+        f'<tr><td class="label">IP address</td><td class="value">{device.get("ip", "unknown")}</td></tr>',
+        f'<tr><td class="label">MAC address</td><td class="value">{mac}</td></tr>',
+        f'<tr><td class="label">Vendor</td><td class="value">{device.get("vendor") or "unknown"}</td></tr>',
+    ])
+
+    content = f"""\
+<h1>Trust this device?</h1>
+<table>{rows}</table>
+<p>Marking this trusted stops future alerts for it and clears any active cooldown.</p>
+<form method="POST" action="/confirm/trust/{token}">
+  <button type="submit" class="btn-confirm">Confirm Trust</button>
+</form>"""
+    return _PAGE_SHELL.format(content=content)
+
+
+def _render_result_page(result: dict) -> str:
+    if result["success"]:
+        content = (
+            '<h1 class="status-ok">Device trusted</h1>'
+            f'<p><strong>{result["display_name"]}</strong> has been marked trusted. '
+            'You will no longer receive alerts for it unless it\'s untrusted again '
+            'from the dashboard.</p>'
+        )
+        return _PAGE_SHELL.format(content=content)
+
+    reason = result["reason"]
+    display_name = result.get("display_name") or result.get("mac") or "this device"
+    messages = {
+        "unavailable": "Trust links are not enabled on this Cerberus instance.",
+        "malformed": "This link is malformed and cannot be used.",
+        "bad_signature": "This link's signature does not match — it may have been altered.",
+        "expired": "This link has expired.",
+        "already_used": f"This link was already used — {display_name} should already be trusted.",
+        "device_not_found": f"The device for this link is no longer in Cerberus's records.",
+        "trust_failed": f"Could not mark {display_name} trusted — please try from the dashboard.",
+    }
+    body = messages.get(reason, "This link could not be processed.")
+    content = f'<h1 class="status-error">Could not confirm</h1><p>{body}</p>'
+    return _PAGE_SHELL.format(content=content)
 
 
 # ---------------------------------------------------------------------------
@@ -373,3 +578,70 @@ if __name__ == "__main__":
 
         store2.close()
         print("All auth assertions passed.")
+
+        # --- Trust confirmation flow (this revision) ---
+        from cerberus.utils.link_tokens import generate_token
+
+        store3 = DeviceStore(_os.path.join(tempfile.mkdtemp(), "test3.db"))
+        store3.upsert({
+            "mac": "bb:cc:dd:ee:ff:99", "ip": "192.168.1.50",
+            "network": "192.168.1.0/24", "scanner": "scapy",
+            "hostname": "mystery-phone",
+        })
+        service3 = CerberusService(device_store=store3, link_secret="test-secret-123")
+        app3 = create_app(service3, api_secret=None)  # /confirm/* ignores this anyway
+        client3 = app3.test_client()
+
+        token, token_id, expires_at = generate_token(
+            mac="bb:cc:dd:ee:ff:99", purpose="trust",
+            secret="test-secret-123", expiry_hours=1,
+        )
+
+        # GET must have no side effects
+        r = client3.get(f"/confirm/trust/{token}")
+        assert r.status_code == 200
+        assert b"Trust this device" in r.data
+        assert b"mystery-phone" in r.data
+        print("[PASS] GET /confirm/trust/<token> renders confirmation page with device info")
+
+        device_before = service3.get_device("bb:cc:dd:ee:ff:99")
+        assert device_before["trusted"] is False
+        print("[PASS] GET request had no side effect — device still untrusted")
+
+        # POST actually redeems it
+        r = client3.post(f"/confirm/trust/{token}")
+        assert r.status_code == 200
+        assert b"Device trusted" in r.data
+        print("[PASS] POST /confirm/trust/<token> confirms trust")
+
+        device_after = service3.get_device("bb:cc:dd:ee:ff:99")
+        assert device_after["trusted"] is True
+        print("[PASS] Device actually marked trusted in DB")
+
+        # Second POST with same token must be rejected (single-use)
+        r = client3.post(f"/confirm/trust/{token}")
+        assert r.status_code == 200
+        assert b"already been used" in r.data or b"already be trusted" in r.data
+        print("[PASS] Replayed token rejected on second POST")
+
+        # Bad token
+        r = client3.get("/confirm/trust/not-a-real-token")
+        assert r.status_code == 200
+        assert b"Invalid link" in r.data
+        print("[PASS] Malformed token shows 'Invalid link'")
+
+        # No X-API-Key needed for /confirm/* even with auth enabled elsewhere
+        service4 = CerberusService(device_store=store3, link_secret="test-secret-123")
+        app4 = create_app(service4, api_secret="some-dashboard-secret")
+        client4 = app4.test_client()
+        token2, _, _ = generate_token(
+            mac="bb:cc:dd:ee:ff:99", purpose="trust",
+            secret="test-secret-123", expiry_hours=1,
+        )
+        r = client4.get(f"/confirm/trust/{token2}")  # no X-API-Key header
+        assert r.status_code == 200
+        assert b"Invalid link" not in r.data
+        print("[PASS] /confirm/trust/<token> works without X-API-Key even when API auth is enabled")
+
+        store3.close()
+        print("\nAll Trust confirmation flow assertions passed.")
