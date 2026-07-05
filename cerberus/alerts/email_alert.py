@@ -2,22 +2,37 @@
 """
 alerts/email_alert.py
 
-Job: one concrete alert channel — SMTP send, given a verdict + message.
+Job: one concrete alert channel — SMTP send, given a verdict + composed
+AlertMessage (see alerts/alert_manager.py's AlertMessage dataclass).
 
 Rules:
   - Reads SMTP credentials from config_loader.get_config() — never
     hardcoded, never reads env vars or files directly itself.
-  - Knows NOTHING about cooldowns, trust logic, or scanning.
-    alert_manager decides WHETHER to call this — this module only
-    knows HOW to send.
+  - Knows NOTHING about cooldowns, trust logic, scanning, or how the
+    message body/links were built. alert_manager decides WHETHER to
+    call this and builds the ENTIRE message content — this module only
+    knows HOW to send it.
   - Matches the (verdict, message) signature alert_manager.register_channel()
-    expects: send_fn(verdict: DeviceVerdict, message: str) -> None
+    expects: send_fn(verdict: DeviceVerdict, message: AlertMessage) -> None
   - Any send failure raises — alert_manager already wraps channel calls
     in try/except per-channel, so a raised exception here is caught
     there and logged, without blocking other registered channels.
   - If email_alerts_enabled is False in config, send() is a no-op that
     logs at DEBUG and returns — lets you register the channel
     unconditionally without an extra "if enabled" check at every call site.
+
+Multipart HTML email (this revision):
+  message now carries BOTH .text and .html bodies (see AlertMessage in
+  alert_manager.py) instead of a single plain string. This module sends
+  them as a multipart/alternative MIME message — every email client
+  picks whichever part it supports; clients that render HTML show the
+  styled Trust/Block buttons, text-only clients (and screen readers)
+  fall back to .text, which contains the same information as plain
+  URLs instead of styled links. The plain-text part is listed FIRST in
+  the MIME structure per RFC 2046's ordering convention (least-preferred
+  alternative first) — most clients render the LAST part they support,
+  so HTML lands last and is what's actually shown wherever HTML
+  rendering is available.
 
 Usage:
     from cerberus.alerts.email_alert import EmailAlert
@@ -46,6 +61,9 @@ class EmailAlert:
     Usage:
         email = EmailAlert()
         email.send(verdict, message)   # called by alert_manager._fire()
+                                        # message is an AlertMessage
+                                        # (see alert_manager.py), not a
+                                        # plain string, as of this revision
     """
 
     def __init__(self):
@@ -87,7 +105,7 @@ class EmailAlert:
     # Public API — matches alert_manager's send_fn(verdict, message) contract
     # ------------------------------------------------------------------
 
-    def send(self, verdict: DeviceVerdict, message: str) -> None:
+    def send(self, verdict: DeviceVerdict, message) -> None:
         """
         Send one alert email. Called by AlertManager._fire() — never
         called directly by scheduler, trust_engine, or anything else.
@@ -95,10 +113,15 @@ class EmailAlert:
         Args:
             verdict : DeviceVerdict — used only for the subject line here.
                       alert_manager has already decided this is alert-worthy
-                      and already formatted `message` — this method does
-                      not re-evaluate trust or re-format content.
-            message : Pre-formatted human-readable body from
-                      alert_manager._format_message().
+                      and already formatted the message content — this
+                      method does not re-evaluate trust or re-format content.
+            message : alerts.alert_manager.AlertMessage — carries both
+                      .text and .html bodies, already fully composed
+                      (Trust link, Block link, router creds, all baked
+                      in) by alert_manager. This module reads .text and
+                      .html only; it never inspects .trust_link or
+                      .block_link directly, since it has no business
+                      logic of its own about what those mean.
 
         Raises:
             Re-raises any smtplib/socket exception so alert_manager's
@@ -172,13 +195,37 @@ class EmailAlert:
             prefix = "↩ Cerberus: returning unknown device"
         return f"{prefix} — {verdict.display_name} ({verdict.ip})"
 
-    def _build_mime(self, subject: str, body: str) -> MIMEMultipart:
-        msg = MIMEMultipart()
+    def _build_mime(self, subject: str, message) -> MIMEMultipart:
+        """
+        Build a multipart/alternative message with both the plain-text
+        and HTML bodies from the AlertMessage. "alternative" (not
+        "mixed") tells email clients these two parts represent the SAME
+        content in two forms — render one or the other, not both.
+
+        message is duck-typed here rather than type-hinted against
+        AlertMessage directly, to avoid a circular import between
+        alert_manager.py and this module (alert_manager already imports
+        FROM email_alert indirectly via cerberus_main.py's wiring, not
+        the reverse — but keeping this module import-light is simplest).
+        Any object with .text and .html string attributes works.
+        """
+        msg = MIMEMultipart("alternative")
         msg["From"]    = self._sender
         msg["To"]      = ", ".join(self._recipients)
         msg["Subject"] = subject
         msg["Date"]    = formatdate(localtime=True)
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        text_body = getattr(message, "text", None) or str(message)
+        html_body = getattr(message, "html", None)
+
+        # Plain-text part first, HTML part last — most clients render
+        # the LAST alternative part they're capable of displaying, so
+        # this ordering makes HTML the "preferred" rendering wherever
+        # supported, with .text as the genuine fallback everywhere else.
+        msg.attach(MIMEText(text_body, "plain", "utf-8"))
+        if html_body:
+            msg.attach(MIMEText(html_body, "html", "utf-8"))
+
         return msg
 
 
@@ -188,6 +235,7 @@ class EmailAlert:
 
 if __name__ == "__main__":
     import sys
+    from dataclasses import dataclass
     from datetime import datetime, timezone
 
     logging.basicConfig(
@@ -222,7 +270,17 @@ if __name__ == "__main__":
         )
         sys.exit(0)
 
-    print("Step 2: Sending one real test alert email...")
+    print("Step 2: Sending one real test alert email (with HTML + text parts)...")
+
+    # Minimal local stand-in for AlertMessage — avoids importing
+    # alert_manager.py just for this smoke test (keeps this test
+    # runnable even if alert_manager.py has an unrelated issue).
+    @dataclass
+    class _FakeAlertMessage:
+        text: str
+        html: str
+        trust_link: str = None
+        block_link: str = None
 
     fake_verdict = DeviceVerdict(
         mac="aa:bb:cc:dd:ee:ff",
@@ -237,12 +295,31 @@ if __name__ == "__main__":
         last_seen=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         network="192.168.1.0/24",
     )
-    fake_message = (
-        "This is a TEST alert from Cerberus v2's email_alert.py smoke test.\n"
-        "If you received this, your SMTP configuration is working correctly.\n"
-        "No actual unknown device was detected — this is a drill."
+    fake_message = _FakeAlertMessage(
+        text=(
+            "This is a TEST alert from Cerberus v2's email_alert.py smoke test.\n"
+            "If you received this, your SMTP configuration is working correctly.\n"
+            "No actual unknown device was detected — this is a drill.\n\n"
+            "TRUST THIS DEVICE:\nhttp://localhost:5000/confirm/trust/FAKE_TOKEN\n\n"
+            "BLOCK THIS DEVICE:\nhttp://192.168.1.1\n"
+            "Router login — username: admin  password: (test)"
+        ),
+        html=(
+            "<html><body style='background:#080B10;color:#D7E1EA;"
+            "font-family:sans-serif;padding:24px;'>"
+            "<h2 style='color:#FF5D4A;'>TEST ALERT</h2>"
+            "<p>This is a TEST alert from Cerberus v2's email_alert.py smoke test.</p>"
+            "<p>If you can read this styled version, HTML rendering works.</p>"
+            "<a href='http://localhost:5000/confirm/trust/FAKE_TOKEN' "
+            "style='background:#3FE0E8;color:#080B10;padding:12px 24px;"
+            "text-decoration:none;font-weight:bold;'>Trust this device</a>"
+            "</body></html>"
+        ),
+        trust_link="http://localhost:5000/confirm/trust/FAKE_TOKEN",
+        block_link="http://192.168.1.1",
     )
 
     email.send(fake_verdict, fake_message)
-    print("\nTest email sent. Check your inbox.")
+    print("\nTest email sent — check your inbox for both a styled HTML view "
+          "and, if you view 'plain text' / 'original message', the text fallback.")
     print("=" * 60)
