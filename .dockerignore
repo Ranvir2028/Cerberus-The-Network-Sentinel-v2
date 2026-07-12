@@ -1,0 +1,35 @@
+# Never bake secrets into the image
+.env
+.env.*
+!.env.example
+
+# npcap_installer.py is Windows-only and irrelevant inside a Linux
+# container — per the original README's own rule ("npcap_installer.py
+# never ships in the container image"). cerberus_main.py's import of
+# this module is defensive (try/except) specifically to make this
+# exclusion safe — see that file's comment.
+cerberus/utils/npcap_installer.py
+
+# Runtime state — these are bind-mounted at container start, not
+# baked into the image. Including them here would just bloat the
+# build context and risk shipping your actual device DB/logs inside
+# the image layers.
+data/
+logs/
+config/config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Frontend (built separately via frontend/Dockerfile with its own context)
+frontend/
+
+# VCS / editor
+.git/
+.gitignore
+.vscode/
+*.md

@@ -28,6 +28,7 @@
 
   --copper:        #E0913F;   /* molten copper — attention, learning mode */
   --copper-dim:    rgba(224, 145, 63, 0.12);
+  --copper-line:   rgba(224, 145, 63, 0.45);
 
   --threat:        #FF5D4A;   /* hot coral — untrusted / active alert only */
   --threat-dim:    rgba(255, 93, 74, 0.12);
@@ -39,7 +40,8 @@
   --font-hud:     'Rajdhani', sans-serif;   /* labels, headers, UI chrome */
   --font-mono:    'JetBrains Mono', monospace; /* raw telemetry: MAC/IP/time */
 
-  --radius-cut: 14px; /* corner clip size, not border-radius */
+  --radius-cut: 12px; /* corner clip size, not border-radius */
+  --rail-cut:   10px;
 }
 
 * { box-sizing: border-box; }
@@ -87,20 +89,45 @@ input:focus-visible {
 }
 
 /* Angular clipped-corner panel shape — the core visual signature.
-   Applied via clip-path so it works on any panel without extra markup. */
+   Applied to every major surface: main panels, stat cards, and the
+   left tactical rail, so nothing on screen reads as a soft default
+   card — consistent with avoiding any "default AI dashboard" look.
+   Background is a subtle diagonal gradient rather than a flat fill —
+   gives the surfaces real depth instead of looking like solid-color
+   placeholder cards. */
 .panel,
-.stat-card {
+.stat-card,
+.tactical-rail {
   clip-path: polygon(
     0 0, calc(100% - var(--radius-cut)) 0, 100% var(--radius-cut),
     100% 100%, var(--radius-cut) 100%, 0 calc(100% - var(--radius-cut))
   );
   position: relative;
+  background: linear-gradient(165deg, var(--surface-raised) 0%, var(--surface) 55%);
 }
 
-/* Corner reticle brackets — the signature detail, restrained to
-   the two "live" corners of each panel so it reads as targeting
-   hardware, not decoration smeared everywhere. */
-.panel::after {
+/* Thin gradient accent along the top edge — cyan fading to nothing —
+   the kind of restrained detail that reads as "instrument panel"
+   rather than "flat card." */
+.panel::before,
+.stat-card::before,
+.tactical-rail::before {
+  content: '';
+  position: absolute;
+  top: 0; left: var(--radius-cut); right: var(--radius-cut);
+  height: 1px;
+  background: linear-gradient(90deg, var(--cyan-line) 0%, transparent 75%);
+  pointer-events: none;
+}
+
+/* Corner reticle brackets — the signature detail, on the top-left
+   corner of EVERY major panel (table, alert feed, tactical rail,
+   stat cards) so the whole screen consistently reads as targeting
+   hardware, not decoration applied inconsistently to only some
+   surfaces. */
+.panel::after,
+.stat-card::after,
+.tactical-rail::after {
   content: '';
   position: absolute;
   top: 0; left: 0;
@@ -108,6 +135,16 @@ input:focus-visible {
   border-top: 2px solid var(--cyan-line);
   border-left: 2px solid var(--cyan-line);
   pointer-events: none;
+  transition: border-color 0.25s;
+}
+
+/* When learning mode is active, the rail's own bracket (and border)
+   shift from cyan to copper — the "heavy toggle mechanism that
+   shifts the sector color" from the spec, applied to the whole rail,
+   not just the toggle switch itself. */
+.tactical-rail.learning-active::after {
+  border-top-color: var(--copper-line);
+  border-left-color: var(--copper-line);
 }
 
 /* ------------------------------------------------------------
@@ -117,30 +154,36 @@ input:focus-visible {
 .app {
   position: relative;
   z-index: 1;
-  max-width: 1200px;
+  max-width: 1320px;
   margin: 0 auto;
   padding: 28px 20px 60px;
 }
+
+/* ------------------------------------------------------------
+   Header Sentinel Bar
+   ------------------------------------------------------------ */
 
 .header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 24px;
   margin-bottom: 22px;
   padding-bottom: 20px;
   border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
 }
 
 .brand {
   display: flex;
   align-items: center;
   gap: 14px;
+  flex-shrink: 0;
 }
 
 .brand-mark {
-  width: 46px;
-  height: 46px;
+  width: 42px;
+  height: 42px;
   flex-shrink: 0;
   display: flex;
   align-items: center;
@@ -151,20 +194,59 @@ input:focus-visible {
 .brand-name {
   font-family: var(--font-display);
   font-weight: 700;
-  font-size: 20px;
+  font-size: 19px;
   letter-spacing: 1.5px;
   color: var(--text);
   text-transform: uppercase;
 }
 
 .brand-sub {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-faint);
   font-family: var(--font-mono);
   letter-spacing: 1.5px;
   text-transform: uppercase;
   margin-top: 2px;
 }
+
+/* Global HUD readouts — System / Network / Devices / Scan, always
+   visible in the header rather than buried in the stat row below. */
+.hud-readouts {
+  display: flex;
+  align-items: center;
+  gap: 26px;
+  flex: 1;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.hud-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  min-width: 64px;
+}
+
+.hud-label {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.hud-value {
+  font-family: var(--font-hud);
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--text);
+  letter-spacing: 0.02em;
+}
+
+.hud-value.mono { font-family: var(--font-mono); font-size: 12px; font-weight: 500; }
+.hud-value.ok { color: var(--cyan); }
+.hud-value.err { color: var(--threat); }
 
 .conn-pill {
   display: flex;
@@ -179,22 +261,202 @@ input:focus-visible {
   border: 1px solid var(--line-bright);
   white-space: nowrap;
   clip-path: polygon(10px 0, 100% 0, 100% 100%, 0 100%, 0 10px);
+  flex-shrink: 0;
 }
 
-/* Radar-sweep status indicator — replaces the plain pulsing dot.
-   A rotating conic gradient inside a ring reads as an active scan
-   sweep, not a generic "online" light. */
-.radar {
-  width: 14px;
-  height: 14px;
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.icon-header-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  background: transparent;
+  border: 1px solid var(--line-bright);
+  color: var(--text-muted);
+  clip-path: polygon(8px 0, 100% 0, 100% 100%, 0 100%, 0 8px);
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.icon-header-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+
+.toggle-switch.small {
+  width: 34px;
+  height: 18px;
+  border-radius: 9px;
+}
+
+.toggle-switch.small .toggle-knob {
+  width: 12px;
+  height: 12px;
+}
+
+.toggle-switch.small.on .toggle-knob {
+  left: 18px;
+}
+
+/* ------------------------------------------------------------
+   Alert bell + dropdown (replaces a permanently-visible feed panel —
+   an alarm/notification system should sit quiet until checked, not
+   occupy a third of the screen at all times)
+   ------------------------------------------------------------ */
+
+.alert-bell-wrap {
+  position: relative;
+}
+
+.alert-bell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  background: transparent;
+  border: 1px solid var(--line-bright);
+  color: var(--text-muted);
+  position: relative;
+  clip-path: polygon(8px 0, 100% 0, 100% 100%, 0 100%, 0 8px);
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.alert-bell:hover { border-color: var(--text-muted); color: var(--text); }
+.alert-bell.has-alerts { border-color: var(--threat); color: var(--threat); }
+
+.alert-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  background: var(--threat);
+  color: #080B10;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+}
+
+.alert-dropdown {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  width: 340px;
+  max-height: 420px;
+  background: var(--surface-raised);
+  border: 1px solid var(--line-bright);
+  box-shadow: 0 12px 32px rgba(0,0,0,0.45);
+  z-index: 20;
+  clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 10px 100%, 0 calc(100% - 10px));
+  display: flex;
+  flex-direction: column;
+}
+
+.alert-dropdown-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.text-link-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0;
+}
+
+.text-link-btn:hover { color: var(--threat); }
+
+.alert-item-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.alert-delete-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-faint);
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.alert-delete-btn:hover { color: var(--threat); }
+
+.alert-dropdown-body {
+  overflow-y: auto;
+  max-height: 370px;
+}
+
+/* ------------------------------------------------------------
+   Scan-status strip — replaces the old always-on decorative wave.
+   Flat and dim at rest; only sweeps with real motion while a scan is
+   genuinely in progress. Bright/animated signal reserved for a real
+   active state, never permanent decoration.
+   ------------------------------------------------------------ */
+
+.scan-strip {
+  height: 2px;
+  background: var(--line);
+  margin: 0 0 20px;
+  overflow: hidden;
+  position: relative;
+}
+
+.scan-strip-fill {
+  height: 100%;
+  width: 30%;
+  background: var(--text-faint);
+  opacity: 0.5;
+}
+
+.scan-strip.scanning .scan-strip-fill {
+  background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+  opacity: 1;
+  animation: scan-sweep 1.8s ease-in-out infinite;
+}
+
+@keyframes scan-sweep {
+  0%   { transform: translateX(-100%); width: 30%; }
+  50%  { width: 45%; }
+  100% { transform: translateX(400%); width: 30%; }
+}
+
+/* ------------------------------------------------------------
+   Radar ring — shared by the header pill and every device row.
+   Live = rotating conic sweep. Dormant = still, dim ring, no
+   animation — a device that's gone quiet reads as quiet, not just
+   a differently-colored version of "alive."
+   ------------------------------------------------------------ */
+
+.radar-ring {
+  display: inline-block;
   border-radius: 50%;
   border: 1px solid var(--cyan-line);
   position: relative;
   flex-shrink: 0;
   overflow: hidden;
+  margin-right: 10px;
+  vertical-align: middle;
 }
 
-.radar.live::before {
+.radar-ring.live::before {
   content: '';
   position: absolute;
   inset: 0;
@@ -202,28 +464,14 @@ input:focus-visible {
   animation: sweep 2.2s linear infinite;
 }
 
-.radar.down {
-  border-color: var(--threat);
-}
-.radar.down::before {
-  content: '';
-  position: absolute;
-  inset: 3px;
-  border-radius: 50%;
-  background: var(--threat);
+.radar-ring.dormant {
+  border-color: var(--line-bright);
+  opacity: 0.5;
 }
 
 @keyframes sweep {
   to { transform: rotate(360deg); }
 }
-
-.dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-.dot.live { background: var(--copper); box-shadow: 0 0 8px 1px rgba(224, 145, 63, 0.6); }
 
 /* ------------------------------------------------------------
    Stat row
@@ -237,7 +485,6 @@ input:focus-visible {
 }
 
 .stat-card {
-  background: var(--surface);
   border: 1px solid var(--line);
   padding: 16px 18px;
 }
@@ -263,18 +510,154 @@ input:focus-visible {
 .stat-value.trust-color { color: var(--cyan); }
 
 /* ------------------------------------------------------------
-   Main grid
+   Three-column tactical grid: Left rail / Center monitor / Right feed
    ------------------------------------------------------------ */
 
-.main-grid {
+.tactical-grid {
   display: grid;
-  grid-template-columns: 1fr 330px;
+  grid-template-columns: 210px 1fr;
   gap: 18px;
   align-items: start;
 }
 
+/* ------------------------------------------------------------
+   Left: Tactical Command rail
+   ------------------------------------------------------------ */
+
+.tactical-rail {
+  border: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  transition: border-color 0.25s;
+}
+
+.tactical-rail.learning-active {
+  border-color: var(--copper-line);
+}
+
+.rail-section {
+  padding: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.rail-section:last-child { border-bottom: none; }
+
+.rail-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--cyan);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 12px;
+}
+
+.tactical-rail.learning-active .rail-learning .rail-label {
+  color: var(--copper);
+}
+
+.rail-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rail-nav-item {
+  background: transparent;
+  border: 1px solid var(--line-bright);
+  color: var(--text-muted);
+  padding: 9px 12px;
+  font-size: 12px;
+  font-family: var(--font-hud);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  text-align: left;
+  clip-path: polygon(6px 0, 100% 0, 100% 100%, 0 100%, 0 6px);
+}
+
+.rail-nav-item.active {
+  border-color: var(--copper);
+  color: var(--copper);
+  background: var(--copper-dim);
+}
+
+.rail-nav-item:hover:not(.active) {
+  border-color: var(--text-muted);
+  color: var(--text);
+}
+
+/* Heavy toggle mechanism — a real switch, not just a button, so
+   Learning Mode reads as flipping a physical state rather than
+   clicking a link. */
+.learning-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.toggle-switch {
+  width: 42px;
+  height: 22px;
+  border-radius: 11px;
+  border: 1px solid var(--line-bright);
+  background: var(--surface-raised);
+  position: relative;
+  padding: 0;
+  flex-shrink: 0;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.toggle-switch.on {
+  border-color: var(--copper);
+  background: linear-gradient(90deg, var(--copper-dim), rgba(224,145,63,0.22));
+}
+
+.toggle-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  transition: left 0.2s, background 0.2s, box-shadow 0.2s;
+}
+
+.toggle-switch.on .toggle-knob {
+  left: 22px;
+  background: var(--copper);
+  box-shadow: 0 0 8px 1px rgba(224, 145, 63, 0.6);
+}
+
+.toggle-state-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.learning-remaining {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 500;
+  color: var(--copper);
+  letter-spacing: 0.02em;
+}
+
+.hint-text {
+  font-size: 11px;
+  color: var(--text-faint);
+  line-height: 1.6;
+  font-family: var(--font-mono);
+}
+
+/* ------------------------------------------------------------
+   Center + right shared panel chrome
+   ------------------------------------------------------------ */
+
 .panel {
-  background: var(--surface);
   border: 1px solid var(--line);
   overflow: hidden;
 }
@@ -304,32 +687,10 @@ input:focus-visible {
 }
 
 .panel-body { padding: 0; }
-.panel-body.padded { padding: 18px; }
 
 /* ------------------------------------------------------------
-   Device table
+   Device table (center monitor)
    ------------------------------------------------------------ */
-
-.filter-tabs { display: flex; gap: 2px; }
-
-.filter-tab {
-  background: transparent;
-  border: 1px solid var(--line-bright);
-  color: var(--text-muted);
-  padding: 6px 14px;
-  font-size: 12px;
-  font-family: var(--font-hud);
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  clip-path: polygon(6px 0, 100% 0, 100% 100%, 0 100%, 0 6px);
-}
-
-.filter-tab.active {
-  border-color: var(--copper);
-  color: var(--copper);
-  background: var(--copper-dim);
-}
 
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 
@@ -339,19 +700,47 @@ thead th {
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--text-faint);
-  padding: 11px 18px;
+  padding: 11px 16px;
   border-bottom: 1px solid var(--line);
   font-weight: 600;
 }
 
+/* The panel's top-right corner is diagonally clipped — without this,
+   the header row's last cell content sits flush against that cut and
+   gets visually collided/truncated by it. Same reasoning applies to
+   the last row's first cell against the bottom-left cut. */
+thead th:last-child {
+  padding-right: calc(var(--radius-cut) + 12px);
+}
+
+tbody tr:last-child td:first-child {
+  padding-bottom: calc(11px + var(--radius-cut) * 0.5);
+}
+
 tbody td {
-  padding: 13px 18px;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--line);
   vertical-align: middle;
 }
 
+tbody td:last-child {
+  padding-right: calc(var(--radius-cut) + 8px);
+}
+
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: var(--surface-raised); }
+
+/* Newly-discovered device — a brief, FINITE glow (3 pulses, then it
+   settles to normal) rather than a permanent ambient effect. Bright
+   signal is reserved for the moment something actually changed. */
+tbody tr.is-new {
+  animation: new-device-glow 1.4s ease-in-out 3;
+}
+
+@keyframes new-device-glow {
+  0%, 100% { background: transparent; box-shadow: inset 0 0 0 0 transparent; }
+  50% { background: var(--cyan-dim); box-shadow: inset 3px 0 0 0 var(--cyan); }
+}
 
 .device-name {
   font-weight: 600;
@@ -366,10 +755,12 @@ tbody tr:hover { background: var(--surface-raised); }
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-faint);
+  padding-left: 23px; /* aligns under the name text, past the radar ring */
 }
 
 .mono { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); }
 
+.status-badge,
 .trust-badge {
   display: inline-flex;
   align-items: center;
@@ -384,8 +775,11 @@ tbody tr:hover { background: var(--surface-raised); }
   clip-path: polygon(6px 0, 100% 0, 100% 100%, 0 100%, 0 6px);
 }
 
-.trust-badge.trusted { background: var(--cyan-dim); color: var(--cyan); border-color: var(--cyan-line); }
-.trust-badge.untrusted { background: var(--threat-dim); color: var(--threat); border-color: rgba(255,93,74,0.35); }
+.status-badge.active { background: linear-gradient(90deg, var(--cyan-dim), rgba(63,224,232,0.18)); color: var(--cyan); border-color: var(--cyan-line); }
+.status-badge.dormant { background: transparent; color: var(--text-faint); border-color: var(--line-bright); }
+
+.trust-badge.trusted { background: linear-gradient(90deg, var(--cyan-dim), rgba(63,224,232,0.18)); color: var(--cyan); border-color: var(--cyan-line); }
+.trust-badge.untrusted { background: linear-gradient(90deg, var(--threat-dim), rgba(255,93,74,0.18)); color: var(--threat); border-color: rgba(255,93,74,0.35); }
 
 .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
 
@@ -407,22 +801,6 @@ tbody tr:hover { background: var(--surface-raised); }
 .icon-btn.danger:hover { border-color: var(--threat); color: var(--threat); background: var(--threat-dim); }
 .icon-btn.safe:hover { border-color: var(--cyan); color: var(--cyan); background: var(--cyan-dim); }
 
-/* Per-row live indicator — small HUD tick, not a soft pulsing dot */
-.pulse-dot {
-  width: 3px;
-  height: 13px;
-  background: var(--cyan);
-  box-shadow: 0 0 6px 0 var(--cyan-line);
-  display: inline-block;
-  margin-right: 10px;
-  animation: tick 2.4s ease-in-out infinite;
-}
-
-@keyframes tick {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.35; }
-}
-
 .empty-state {
   padding: 44px 20px;
   text-align: center;
@@ -432,7 +810,7 @@ tbody tr:hover { background: var(--surface-raised); }
 }
 
 /* ------------------------------------------------------------
-   Side panel — alerts + learning mode
+   Alert item styling — shared by the dropdown body
    ------------------------------------------------------------ */
 
 .alert-item { padding: 13px 18px; border-bottom: 1px solid var(--line); font-size: 12px; }
@@ -456,68 +834,18 @@ tbody tr:hover { background: var(--surface-raised); }
 .alert-time { font-family: var(--font-mono); font-size: 10px; color: var(--text-faint); }
 .alert-summary { color: var(--text-muted); font-family: var(--font-mono); font-size: 11.5px; }
 
-.learning-box { padding: 18px; }
-
-.learning-status-line {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  margin-bottom: 12px;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.learning-status-line .dot.learning {
-  background: var(--copper);
-  box-shadow: 0 0 8px 1px rgba(224, 145, 63, 0.6);
-  animation: tick 2s ease-in-out infinite;
-}
-
-.learning-remaining {
-  font-family: var(--font-mono);
-  font-size: 24px;
-  font-weight: 500;
-  color: var(--copper);
-  margin-bottom: 14px;
-  letter-spacing: 0.02em;
-}
-
-.btn {
-  width: 100%;
-  padding: 11px 14px;
-  border: 1px solid var(--line-bright);
-  background: var(--surface-raised);
-  color: var(--text);
-  font-size: 12.5px;
-  font-weight: 700;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  font-family: var(--font-hud);
-  margin-bottom: 9px;
-  transition: border-color 0.15s, background 0.15s;
-  clip-path: polygon(8px 0, 100% 0, 100% 100%, 0 100%, 0 8px);
-}
-
-.btn:hover { border-color: var(--text-muted); }
-.btn.primary { border-color: var(--copper); color: var(--copper); }
-.btn.primary:hover { background: var(--copper-dim); }
-.btn.stop { border-color: var(--threat); color: var(--threat); }
-.btn.stop:hover { background: var(--threat-dim); }
-
-.hint-text {
-  font-size: 11px;
-  color: var(--text-faint);
-  line-height: 1.6;
-  margin-top: 4px;
-  font-family: var(--font-mono);
-}
-
 /* ------------------------------------------------------------
    Responsive
    ------------------------------------------------------------ */
 
+@media (max-width: 1080px) {
+  .tactical-grid { grid-template-columns: 1fr; }
+  .tactical-rail { flex-direction: row; flex-wrap: wrap; }
+  .rail-section { flex: 1; min-width: 200px; }
+  .hud-readouts { order: 3; width: 100%; justify-content: flex-start; }
+}
+
 @media (max-width: 860px) {
-  .main-grid { grid-template-columns: 1fr; }
   .stats { grid-template-columns: repeat(2, 1fr); }
 }
 
@@ -528,4 +856,169 @@ tbody tr:hover { background: var(--surface-raised); }
   thead th:nth-child(3), tbody td:nth-child(3) { display: none; }
   .row-actions { flex-direction: column; }
   .brand-name { font-size: 16px; }
+  .hud-readouts { gap: 14px; }
+  .alert-dropdown { width: calc(100vw - 40px); right: -12px; }
+  .modal-panel { width: calc(100vw - 32px); }
+}
+
+/* ------------------------------------------------------------
+   Settings modal
+   ------------------------------------------------------------ */
+
+.btn {
+  padding: 11px 20px;
+  border: 1px solid var(--line-bright);
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-family: var(--font-hud);
+  transition: border-color 0.15s, background 0.15s;
+  clip-path: polygon(8px 0, 100% 0, 100% 100%, 0 100%, 0 8px);
+}
+
+.btn:hover:not(:disabled) { border-color: var(--text-muted); }
+.btn:disabled { opacity: 0.5; cursor: default; }
+.btn.primary { border-color: var(--cyan); color: var(--cyan); }
+.btn.primary:hover:not(:disabled) { background: var(--cyan-dim); }
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 11, 16, 0.75);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  padding: 20px;
+}
+
+.modal-panel {
+  width: 520px;
+  max-width: 100%;
+  max-height: 85vh;
+  background: linear-gradient(165deg, var(--surface-raised) 0%, var(--surface) 55%);
+  border: 1px solid var(--line-bright);
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  display: flex;
+  flex-direction: column;
+  clip-path: polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 14px 100%, 0 calc(100% - 14px));
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.modal-close {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 22px;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+.modal-close:hover { color: var(--threat); }
+
+.modal-body {
+  padding: 20px;
+  overflow-y: auto;
+}
+
+.modal-footer {
+  padding: 16px 20px;
+  border-top: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.modal-footer .btn { width: 100%; }
+
+.settings-restart-note {
+  font-size: 12px;
+  color: var(--copper);
+  background: var(--copper-dim);
+  border: 1px solid var(--copper-line);
+  padding: 10px 12px;
+  margin: 0 0 20px;
+  line-height: 1.5;
+}
+
+.settings-group {
+  margin-bottom: 22px;
+}
+
+.settings-group-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--cyan);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.settings-row input[type="number"] {
+  width: 90px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--line-bright);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: right;
+}
+
+.settings-row input[type="number"]:focus {
+  outline: 1px solid var(--cyan);
+}
+
+.settings-row-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.secrets-status-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.secrets-status-table td {
+  padding: 6px 0;
+  color: var(--text-muted);
+}
+
+.secrets-status-table td.yes { color: var(--cyan); text-align: right; font-family: var(--font-mono); }
+.secrets-status-table td.no { color: var(--text-faint); text-align: right; font-family: var(--font-mono); }
+
+.settings-error {
+  color: var(--threat);
+  font-size: 12px;
+  margin-top: 8px;
+}
+
+.settings-saved {
+  color: var(--cyan);
+  font-size: 12px;
+  margin-top: 8px;
 }

@@ -3,16 +3,18 @@
 utils/config_loader.py
 
 Job: load scan intervals, alert toggles, SMTP credentials, DB path,
-learning-mode duration, and mDNS settings from environment variables
-first, with a JSON file as fallback/defaults.
+learning-mode duration, mDNS settings, and (this revision) email
+Trust/Block link-signing secret + router admin credentials from
+environment variables first, with a JSON file as fallback/defaults.
 
 Rules:
   - Loads .env file automatically on first import (python-dotenv).
     The .env file lives at the project root (cerberus_v2/.env) and is
     loaded with override=True — this project's .env always wins over
     any stray system-wide environment variables.
-  - Secrets (SMTP password, API keys) ONLY from env vars / .env —
-    never from config.json, never hardcoded.
+  - Secrets (SMTP password, API keys, link-signing secret, router
+    credentials) ONLY from env vars / .env — never from config.json,
+    never hardcoded.
   - config.json holds non-secret settings (intervals, paths, toggles).
   - Validates required fields and raises ConfigError with clear message.
   - All other modules import get_config() — never read env vars themselves.
@@ -23,6 +25,23 @@ Priority order per field:
   2. config/config.json value
   3. Built-in default
 
+Email Trust/Block links (this revision):
+  CERBERUS_LINK_SECRET — signs the single-use Trust confirmation
+    tokens embedded in alert emails (see utils/link_tokens.py). This
+    is deliberately a SEPARATE secret from CERBERUS_API_SECRET: link
+    tokens are short-lived (hours) and single-use, while the API key
+    is long-lived and reusable — mixing the two would mean rotating
+    one forces rotating the other for no reason. If unset, a random
+    secret is generated at startup and logged as a warning — this
+    still works for a single always-on process, but any previously
+    emailed Trust links become invalid on restart, and multiple
+    processes (e.g. CLI + main) would disagree on signatures. Set it
+    explicitly in .env for anything beyond casual local testing.
+  CERBERUS_ROUTER_USER / CERBERUS_ROUTER_PASSWORD — displayed
+    (not auto-submitted) alongside the Block link in alert emails, so
+    the user can manually log into their router's admin page. Same
+    env-only rule as SMTP — never written to config.json.
+
 Usage:
     from cerberus.utils.config_loader import get_config, ConfigError
 
@@ -31,11 +50,13 @@ Usage:
     smtp_pass = cfg.smtp_password   # from .env / env only
     interval  = cfg.scapy_interval
     mdns_on   = cfg.mdns_enabled
+    link_key  = cfg.link_secret
 """
 
 import json
 import logging
 import os
+import secrets as _secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -92,6 +113,15 @@ _DEFAULT_CONFIG = {
     "api_enabled":                True,
     "mdns_enabled":               True,
     "mdns_interval":              120,
+    "link_token_expiry_hours":    72,
+    "public_base_url":           "",
+    "dhcp_enabled":               True,
+    "dhcp_drain_interval":        60,
+    "ssdp_enabled":               True,
+    "ssdp_interval":              180,
+    "llmnr_enabled":              True,
+    "llmnr_interval":             90,
+    "learning_mode_state_file":  "data/learning_mode.json",
 }
 
 
@@ -141,6 +171,35 @@ class CerberusConfig:
     mdns_enabled:    bool = True   # Set False to disable the mDNS worker entirely
     mdns_interval:   int  = 120    # Seconds between mDNS browse cycles
 
+    # --- Additional passive/active discovery sources (this revision) ---
+    dhcp_enabled:        bool = True   # Continuous background DHCP hostname sniffer
+    dhcp_drain_interval: int  = 60     # Seconds between draining accumulated sightings
+    ssdp_enabled:        bool = True   # UPnP/SSDP device discovery
+    ssdp_interval:       int  = 180    # Seconds between SSDP browse cycles
+    llmnr_enabled:       bool = True   # LLMNR reverse hostname lookup
+    llmnr_interval:      int  = 90     # Seconds between LLMNR resolve cycles
+
+    # --- Learning mode state file (this revision) ---
+    # Previously hardcoded identically as a literal string in BOTH
+    # cerberus_main.py and cli/terminal.py — two places that had to be
+    # kept manually in sync with no enforcement. Centralizing here
+    # removes that duplication risk entirely.
+    learning_mode_state_file: str = "data/learning_mode.json"
+
+    # --- Email Trust/Block links (this revision) ---
+    link_secret:             Optional[str] = None   # CERBERUS_LINK_SECRET env var
+    link_token_expiry_hours: int           = 72      # Trust link validity window
+    router_user:             Optional[str] = None   # CERBERUS_ROUTER_USER env var
+    router_password:         Optional[str] = None   # CERBERUS_ROUTER_PASSWORD env var
+    public_base_url:         str           = ""      # e.g. "http://192.168.1.50:5000" —
+        # the address YOUR devices can actually reach this machine at.
+        # api_host is typically "0.0.0.0" (a bind address, not a URL) so
+        # it can't be used directly in email links. If left blank,
+        # alert_manager.py falls back to "http://localhost:<api_port>",
+        # which only works when opened on the SAME machine Cerberus runs
+        # on — set this explicitly (e.g. your LAN IP) to open Trust links
+        # from your phone or another device on the network.
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -181,6 +240,99 @@ def reset_config() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Editable settings (this revision) — for the dashboard's Settings page.
+#
+# Deliberately a WHITELIST, not "everything in CerberusConfig": secrets
+# (smtp_password, api_secret_key, link_secret, router_user/password)
+# are NEVER included here, in either direction — not readable as a
+# value, not writable through this path. A settings UI, even behind
+# the dashboard's own API auth, should never round-trip a secret back
+# out over HTTP; that's what get_settings_status() below is for
+# instead (configured/not-configured booleans only).
+#
+# Important limitation, stated here rather than left implicit: every
+# key below is read ONCE at cerberus_main.py startup and baked into
+# already-running scheduler threads/scanner objects. There is no live
+# hot-reload mechanism — updating these writes config.json correctly,
+# but the change only takes effect the NEXT time Cerberus is restarted.
+# api/server.py's settings routes and the frontend Settings panel both
+# surface this plainly rather than implying an instant effect.
+# ---------------------------------------------------------------------------
+
+_EDITABLE_CONFIG_KEYS = (
+    "scapy_interval", "nmap_quick_interval", "nmap_aggressive_interval",
+    "aggressive_workers",
+    "mdns_enabled", "mdns_interval",
+    "dhcp_enabled", "dhcp_drain_interval",
+    "ssdp_enabled", "ssdp_interval",
+    "llmnr_enabled", "llmnr_interval",
+    "learning_mode_hours", "alert_cooldown_minutes",
+    "email_alerts_enabled", "log_level",
+)
+
+
+def get_editable_settings(config_file: Optional[str] = None) -> dict:
+    """Current values of every setting the dashboard's Settings page may edit."""
+    cfg = get_config(config_file=config_file)
+    return {k: getattr(cfg, k) for k in _EDITABLE_CONFIG_KEYS}
+
+
+def get_settings_status(config_file: Optional[str] = None) -> dict:
+    """
+    Read-only configured/not-configured indicators for every secret —
+    NEVER the secret value itself, in any form (not even partially
+    masked). A settings UI has no legitimate need to see these values;
+    "is this set or not" is all it needs to tell the operator whether
+    a feature will actually work.
+    """
+    cfg = get_config(config_file=config_file)
+    return {
+        "smtp_configured":          bool(cfg.smtp_password),
+        "api_secret_configured":    bool(cfg.api_secret_key),
+        "link_secret_explicitly_set": bool(os.environ.get("CERBERUS_LINK_SECRET")),
+        "router_credentials_configured": bool(cfg.router_user and cfg.router_password),
+        "public_base_url_set":      bool(cfg.public_base_url),
+    }
+
+
+def update_editable_settings(updates: dict, config_file: Optional[str] = None) -> dict:
+    """
+    Merge `updates` into config.json, restricted to _EDITABLE_CONFIG_KEYS.
+
+    Args:
+        updates: {key: new_value} — every key MUST be in the whitelist.
+
+    Returns:
+        The merged dict of all editable settings after the write
+        (same shape as get_editable_settings()).
+
+    Raises:
+        ValueError: if `updates` contains any key outside the
+                    whitelist — this is the hard boundary that
+                    guarantees a secret can never be smuggled into
+                    config.json through the settings API, even by a
+                    caller that (incorrectly) tries to.
+    """
+    unknown = set(updates.keys()) - set(_EDITABLE_CONFIG_KEYS)
+    if unknown:
+        raise ValueError(f"Not editable via settings: {', '.join(sorted(unknown))}")
+
+    path = config_file or _DEFAULT_CONFIG_FILE
+    current = _load_json(path)
+    current.update(updates)
+    _write_json(path, current)
+
+    # Invalidate the cached config so the NEXT get_config() call (e.g.
+    # the settings page re-reading its own values right after saving)
+    # reflects the write immediately — running scheduler/scanner
+    # objects still won't pick this up until an actual process restart,
+    # per this section's limitation note above.
+    reset_config()
+
+    return {k: current.get(k, getattr(CerberusConfig(), k, None)) for k in _EDITABLE_CONFIG_KEYS}
+
+
+# ---------------------------------------------------------------------------
 # Private — resolution
 # ---------------------------------------------------------------------------
 
@@ -212,6 +364,22 @@ def _resolve(file_values: dict) -> CerberusConfig:
         recipients = [r.strip() for r in env_recipients.split(",") if r.strip()]
     else:
         recipients = recipients_raw if isinstance(recipients_raw, list) else []
+
+    link_secret = os.environ.get("CERBERUS_LINK_SECRET")
+    if not link_secret:
+        # No secret configured — generate an ephemeral one so the
+        # feature still works for a single always-on process, but warn
+        # loudly since it means previously emailed links go stale on
+        # restart and multiple processes won't agree on signatures.
+        link_secret = _secrets.token_hex(32)
+        logger.warning(
+            "CERBERUS_LINK_SECRET not set in .env — generated a random "
+            "ephemeral secret for this run. Trust-confirmation email "
+            "links will stop working after a restart. Set "
+            "CERBERUS_LINK_SECRET in .env for persistent link validity "
+            "(generate one with: python -c \"import secrets; "
+            "print(secrets.token_hex(32))\")."
+        )
 
     return CerberusConfig(
         # Paths
@@ -248,6 +416,27 @@ def _resolve(file_values: dict) -> CerberusConfig:
         # mDNS
         mdns_enabled  = _get("CERBERUS_MDNS_ENABLED",  "mdns_enabled",  True, bool),
         mdns_interval = _get("CERBERUS_MDNS_INTERVAL", "mdns_interval", 120,  int),
+
+        # Additional discovery sources
+        dhcp_enabled        = _get("CERBERUS_DHCP_ENABLED",        "dhcp_enabled",        True, bool),
+        dhcp_drain_interval = _get("CERBERUS_DHCP_DRAIN_INTERVAL", "dhcp_drain_interval", 60,   int),
+        ssdp_enabled        = _get("CERBERUS_SSDP_ENABLED",        "ssdp_enabled",        True, bool),
+        ssdp_interval       = _get("CERBERUS_SSDP_INTERVAL",       "ssdp_interval",       180,  int),
+        llmnr_enabled       = _get("CERBERUS_LLMNR_ENABLED",       "llmnr_enabled",       True, bool),
+        llmnr_interval      = _get("CERBERUS_LLMNR_INTERVAL",      "llmnr_interval",      90,   int),
+
+        # Learning mode state file
+        learning_mode_state_file = _get(
+            "CERBERUS_LEARNING_STATE_FILE", "learning_mode_state_file",
+            "data/learning_mode.json",
+        ),
+
+        # Email Trust/Block links
+        link_secret             = link_secret,                        # env ONLY (or ephemeral)
+        link_token_expiry_hours = _get("CERBERUS_LINK_TOKEN_EXPIRY_HOURS", "link_token_expiry_hours", 72, int),
+        router_user             = os.environ.get("CERBERUS_ROUTER_USER"),      # env ONLY
+        router_password         = os.environ.get("CERBERUS_ROUTER_PASSWORD"),  # env ONLY
+        public_base_url         = _get("CERBERUS_PUBLIC_URL", "public_base_url", "", str).rstrip("/"),
     )
 
 
@@ -268,6 +457,20 @@ def _validate(cfg: CerberusConfig) -> None:
             raise ConfigError(
                 "email_alerts_enabled=True but missing required settings:\n"
                 + "\n".join(f"  - {m}" for m in missing)
+            )
+        if not cfg.router_user or not cfg.router_password:
+            logger.warning(
+                "email_alerts_enabled=True but CERBERUS_ROUTER_USER / "
+                "CERBERUS_ROUTER_PASSWORD not set — alert emails' Block "
+                "section will omit router login credentials."
+            )
+        if not cfg.public_base_url:
+            logger.warning(
+                f"CERBERUS_PUBLIC_URL not set — Trust links in emails will "
+                f"default to http://localhost:{cfg.api_port}, which only "
+                f"opens correctly on THIS machine. Set CERBERUS_PUBLIC_URL "
+                f"to this machine's LAN IP (e.g. http://192.168.1.50:{cfg.api_port}) "
+                f"to open Trust links from your phone or another device."
             )
 
     if cfg.scapy_interval < 10:
@@ -291,6 +494,12 @@ def _validate(cfg: CerberusConfig) -> None:
             f"mdns_interval={cfg.mdns_interval}s is very low for mDNS browsing — "
             "10s+ recommended to avoid excessive multicast traffic."
         )
+    if cfg.link_token_expiry_hours < 1:
+        logger.warning(
+            f"link_token_expiry_hours={cfg.link_token_expiry_hours} is very "
+            "low — Trust confirmation links may expire before the operator "
+            "sees the email."
+        )
 
 
 def _log_summary(cfg: CerberusConfig) -> None:
@@ -310,10 +519,20 @@ def _log_summary(cfg: CerberusConfig) -> None:
                 f"at {cfg.api_host}:{cfg.api_port}")
     logger.info(f"  mDNS discovery   : {'ON' if cfg.mdns_enabled else 'OFF'} "
                 f"(every {cfg.mdns_interval}s)")
+    logger.info(f"  DHCP sniffing    : {'ON' if cfg.dhcp_enabled else 'OFF'} "
+                f"(drained every {cfg.dhcp_drain_interval}s)")
+    logger.info(f"  SSDP discovery   : {'ON' if cfg.ssdp_enabled else 'OFF'} "
+                f"(every {cfg.ssdp_interval}s)")
+    logger.info(f"  LLMNR discovery  : {'ON' if cfg.llmnr_enabled else 'OFF'} "
+                f"(every {cfg.llmnr_interval}s)")
+    logger.info(f"  Trust link expiry: {cfg.link_token_expiry_hours}h")
+    logger.info(f"  Public base URL  : {cfg.public_base_url or f'(auto) http://localhost:{cfg.api_port}'}")
     if cfg.smtp_password:
         logger.info("  SMTP password    : [set via .env]")
     if cfg.api_secret_key:
         logger.info("  API secret key   : [set via .env]")
+    if cfg.router_user:
+        logger.info("  Router creds     : [set via .env]")
 
 
 # ---------------------------------------------------------------------------
@@ -344,18 +563,32 @@ def _load_json(config_path: str) -> dict:
         return {}
 
 
-def _write_default_config(path: Path) -> None:
-    """Write default config.json on first run."""
+def _write_json(path, data: dict) -> None:
+    """
+    Write any dict to a config.json-shaped file. Generalized out of
+    what used to be _write_default_config()'s hardcoded body, since
+    update_editable_settings() (this revision) needs to write an
+    arbitrary MERGED dict back, not just the original defaults.
+
+    Accepts either a str or Path for `path` — coerced to Path
+    immediately, since callers pass both (config_loader's internal
+    Path usage vs. update_editable_settings() working with the plain
+    str path callers pass in).
+    """
+    path = Path(path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(_DEFAULT_CONFIG, f, indent=2)
-        logger.info(
-            f"Default config written to {path}. "
-            "Edit it to customise Cerberus behaviour."
-        )
+            json.dump(data, f, indent=2)
+        logger.debug(f"Config written to {path}.")
     except Exception as e:
-        logger.warning(f"Could not write default config to {path}: {e}")
+        logger.warning(f"Could not write config to {path}: {e}")
+
+
+def _write_default_config(path: Path) -> None:
+    """Write default config.json on first run."""
+    _write_json(path, _DEFAULT_CONFIG)
+    logger.info(f"Default config written to {path}. Edit it to customise Cerberus behaviour.")
 
 
 # ---------------------------------------------------------------------------
@@ -377,8 +610,10 @@ if __name__ == "__main__":
         assert cfg.scapy_interval == 60
         assert cfg.mdns_enabled is True
         assert cfg.mdns_interval == 120
+        assert cfg.link_secret is not None  # ephemeral secret generated
+        assert cfg.link_token_expiry_hours == 72
         assert os.path.exists(config_path)
-        print("[PASS] First run: default config written and loaded, mDNS defaults correct")
+        print("[PASS] First run: default config written and loaded, mDNS + link defaults correct")
 
         os.environ["CERBERUS_SCAPY_INTERVAL"] = "30"
         reset_config()
@@ -400,6 +635,23 @@ if __name__ == "__main__":
         assert cfg4.smtp_password == "supersecret"
         print("[PASS] SMTP password from env only")
         del os.environ["CERBERUS_SMTP_PASSWORD"]
+
+        os.environ["CERBERUS_LINK_SECRET"] = "fixed-test-secret"
+        reset_config()
+        cfg_link = get_config(config_file=config_path)
+        assert cfg_link.link_secret == "fixed-test-secret"
+        print("[PASS] CERBERUS_LINK_SECRET honoured when set")
+        del os.environ["CERBERUS_LINK_SECRET"]
+
+        os.environ["CERBERUS_ROUTER_USER"] = "admin"
+        os.environ["CERBERUS_ROUTER_PASSWORD"] = "routerpass"
+        reset_config()
+        cfg_router = get_config(config_file=config_path)
+        assert cfg_router.router_user == "admin"
+        assert cfg_router.router_password == "routerpass"
+        print("[PASS] Router credentials from env only")
+        del os.environ["CERBERUS_ROUTER_USER"]
+        del os.environ["CERBERUS_ROUTER_PASSWORD"]
 
         os.environ["CERBERUS_EMAIL_ALERTS"] = "true"
         reset_config()

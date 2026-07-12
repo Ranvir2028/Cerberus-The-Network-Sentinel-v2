@@ -209,6 +209,34 @@ def create_app(service: CerberusService, api_secret: Optional[str] = None) -> Fl
             return jsonify({"error": f"No device found for MAC {mac}"}), 404
         return jsonify({"mac": mac, "label": label})
 
+    @app.route("/api/devices/<mac>/request-id", methods=["POST"])
+    @_require_api_key
+    def request_device_id(mac: str):
+        """
+        Dashboard-triggered — issues a private, single-use "identify
+        yourself" link for one device, and returns the full shareable
+        URL. The operator copies this link and sends it however they
+        choose (text, WhatsApp, in person) — Cerberus never sends it
+        anywhere itself. Building the full URL from request.host_url
+        here (rather than a configured public_base_url, as the email
+        Trust links need) works naturally since this route is only
+        ever called from an active dashboard session already pointed
+        at the right host.
+        """
+        result = service.request_identify_link(mac)
+        if not result["success"]:
+            status = 404 if result["reason"] == "device_not_found" else 400
+            return jsonify({"error": result["reason"]}), status
+
+        base = request.host_url.rstrip("/")
+        link = f"{base}/confirm/identify/{result['token']}"
+        return jsonify({
+            "mac": result["mac"],
+            "display_name": result["display_name"],
+            "link": link,
+            "expires_at": result["expires_at"],
+        })
+
     @app.route("/api/devices/<mac>", methods=["DELETE"])
     @_require_api_key
     def delete_device(mac: str):
@@ -232,6 +260,20 @@ def create_app(service: CerberusService, api_secret: Optional[str] = None) -> Fl
         limit = request.args.get("limit", default=50, type=int)
         alerts = service.get_recent_alerts(limit=limit)
         return jsonify({"alerts": alerts, "count": len(alerts)})
+
+    @app.route("/api/alerts/<int:alert_id>", methods=["DELETE"])
+    @_require_api_key
+    def delete_alert(alert_id: int):
+        ok = service.delete_alert(alert_id)
+        if not ok:
+            return jsonify({"error": f"No alert found with id {alert_id}"}), 404
+        return jsonify({"id": alert_id, "deleted": True})
+
+    @app.route("/api/alerts", methods=["DELETE"])
+    @_require_api_key
+    def clear_alerts():
+        deleted = service.clear_alerts()
+        return jsonify({"deleted": deleted})
 
     @app.route("/api/alerts/counts", methods=["GET"])
     @_require_api_key
@@ -286,6 +328,31 @@ def create_app(service: CerberusService, api_secret: Optional[str] = None) -> Fl
         return jsonify(service.get_scan_status())
 
     # ------------------------------------------------------------------
+    # Settings (this revision)
+    # ------------------------------------------------------------------
+
+    @app.route("/api/settings", methods=["GET"])
+    @_require_api_key
+    def get_settings():
+        return jsonify(service.get_settings())
+
+    @app.route("/api/settings", methods=["POST"])
+    @_require_api_key
+    def update_settings():
+        """
+        Body: {"scapy_interval": 90, "mdns_enabled": false, ...} — any
+        subset of the editable whitelist. Rejected entirely (400, no
+        partial write) if any key isn't in that whitelist — see
+        cerberus_service.update_settings() / config_loader.py for the
+        whitelist and the reasoning.
+        """
+        body = request.get_json(silent=True) or {}
+        result = service.update_settings(body)
+        if not result["success"]:
+            return jsonify({"error": result["reason"]}), 400
+        return jsonify(result["settings"])
+
+    # ------------------------------------------------------------------
     # Combined snapshot — what the frontend dashboard will poll most
     # ------------------------------------------------------------------
 
@@ -324,6 +391,38 @@ def create_app(service: CerberusService, api_secret: Optional[str] = None) -> Fl
         """
         result = service.redeem_trust_token(token)
         html = _render_result_page(result)
+        return html
+
+    # ------------------------------------------------------------------
+    # Device self-identification (this revision) — also outside
+    # /api/*, unauthenticated by design: the signed token bound to one
+    # specific device IS the credential, same reasoning as the Trust
+    # confirmation routes above. The operator triggers issuance from
+    # the dashboard (POST /api/devices/<mac>/request-id, authenticated)
+    # and shares the resulting link themselves — Cerberus never sends
+    # it anywhere on its own.
+    # ------------------------------------------------------------------
+
+    @app.route("/confirm/identify/<token>", methods=["GET"])
+    def confirm_identify_page(token: str):
+        """
+        Renders the "what's this device?" page. NO side effects —
+        same GET-must-never-mutate reasoning as the Trust routes.
+        """
+        check = service.verify_identify_token(token)
+        html = _render_identify_page(token, check)
+        return html
+
+    @app.route("/confirm/identify/<token>", methods=["POST"])
+    def confirm_identify_submit(token: str):
+        """
+        The actual action — sets the device's label to the submitted
+        name. Only reachable via the page's own form submission.
+        """
+        body = request.form if request.form else (request.get_json(silent=True) or {})
+        name = body.get("name", "")
+        result = service.redeem_identify_link(token, name)
+        html = _render_identify_result_page(result)
         return html
 
     return app
@@ -399,6 +498,17 @@ _PAGE_SHELL = """\
   .status-ok {{ color: #3FE0E8; }}
   .status-warn {{ color: #E0913F; }}
   .status-error {{ color: #FF5D4A; }}
+  input[type="text"] {{
+    width: 100%; padding: 11px 12px; margin-bottom: 14px;
+    background: #080B10; border: 1px solid #2E4152; color: #D7E1EA;
+    font-family: -apple-system, 'Segoe UI', Arial, sans-serif;
+    font-size: 14px; border-radius: 2px;
+  }}
+  input[type="text"]:focus {{ outline: 2px solid #3FE0E8; outline-offset: 1px; }}
+  .device-hint {{
+    font-size: 12px; color: #4A5866; font-family: monospace;
+    margin: -10px 0 18px;
+  }}
 </style>
 </head>
 <body>
@@ -493,6 +603,93 @@ def _render_result_page(result: dict) -> str:
     }
     body = messages.get(reason, "This link could not be processed.")
     content = f'<h1 class="status-error">Could not confirm</h1><p>{body}</p>'
+    return _PAGE_SHELL.format(content=content)
+
+
+def _render_identify_page(token: str, check: dict) -> str:
+    """
+    Renders the "what's this device?" page. Deliberately does NOT ask
+    the visitor anything about their own IP/MAC — the link already
+    names the device via the token, so all they need to do is confirm
+    it's theirs and type a name.
+    """
+    if not check["valid"]:
+        reason = check["reason"]
+        messages = {
+            "unavailable": ("status-error", "Not available",
+                             "Device identification links aren't enabled on this Cerberus instance."),
+            "malformed": ("status-error", "Invalid link",
+                           "This link is invalid or was meant for something else."),
+            "bad_signature": ("status-error", "Invalid link",
+                               "This link's signature does not match — it may have been altered."),
+            "expired": ("status-warn", "Link expired",
+                        "This request has expired. Ask whoever sent it for a new link."),
+        }
+        cls, title, body = messages.get(
+            reason, ("status-error", "Invalid link", "This link could not be verified.")
+        )
+        content = f'<h1 class="{cls}">{title}</h1><p>{body}</p>'
+        return _PAGE_SHELL.format(content=content)
+
+    device = check["device"]
+    mac = check["mac"]
+
+    if check["already_used"]:
+        content = (
+            '<h1 class="status-warn">Already answered</h1>'
+            '<p>This link has already been used to identify this device. '
+            'If that name was wrong, ask the network operator to send a new link.</p>'
+        )
+        return _PAGE_SHELL.format(content=content)
+
+    if not device:
+        content = (
+            '<h1 class="status-error">Device not found</h1>'
+            f'<p>The device for MAC <code>{mac}</code> is no longer in Cerberus\'s '
+            'records — it may have been removed.</p>'
+        )
+        return _PAGE_SHELL.format(content=content)
+
+    # A light, non-identifying hint only — vendor, not personal data —
+    # just enough for the person to recognize "oh, that's my phone."
+    hint = device.get("vendor") or "unknown vendor"
+
+    content = f"""\
+<h1>Is this device yours?</h1>
+<p class="device-hint">Detected vendor: {hint}</p>
+<p>Someone managing this network wants to know whose device this is.
+Type a name below — this only labels the device for the network admin;
+it does not grant it any special access.</p>
+<form method="POST" action="/confirm/identify/{token}">
+  <input type="text" name="name" placeholder="e.g. Priya's Phone" maxlength="80" required autofocus />
+  <button type="submit" class="btn-confirm">Submit</button>
+</form>"""
+    return _PAGE_SHELL.format(content=content)
+
+
+def _render_identify_result_page(result: dict) -> str:
+    if result["success"]:
+        content = (
+            '<h1 class="status-ok">Thanks!</h1>'
+            f'<p>This device is now labeled <strong>{result["display_name"]}</strong> '
+            'for the network admin.</p>'
+        )
+        return _PAGE_SHELL.format(content=content)
+
+    reason = result["reason"]
+    display_name = result.get("display_name") or result.get("mac") or "this device"
+    messages = {
+        "unavailable": "Device identification links aren't enabled on this Cerberus instance.",
+        "malformed": "This link is invalid or was meant for something else.",
+        "bad_signature": "This link's signature does not match — it may have been altered.",
+        "expired": "This link has expired.",
+        "already_used": f"This link was already used to identify {display_name}.",
+        "device_not_found": "The device for this link is no longer in Cerberus's records.",
+        "empty_name": "Please go back and type a name before submitting.",
+        "label_failed": "Could not save the name — please try again.",
+    }
+    body = messages.get(reason, "This link could not be processed.")
+    content = f'<h1 class="status-error">Could not save</h1><p>{body}</p>'
     return _PAGE_SHELL.format(content=content)
 
 

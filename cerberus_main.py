@@ -1,16 +1,38 @@
 """
-cerberus_main.py — Phase 1+2+3 headless engine.
+cerberus_main.py — Phase 1+2+3 headless engine, plus email Trust/Block
+links and the expanded passive/active discovery stack (this revision).
 
 Config priority: env vars > config/config.json > built-in defaults.
 CLI args override config file for quick one-off runs.
 
 Scan tiers:
-  Scapy ARP        every scapy_interval       (default 60s)
-  Nmap quick       every nmap_quick_interval   (default 180s)
+  Scapy ARP        every scapy_interval        (default 60s)
+  Nmap quick       every nmap_quick_interval    (default 180s)
   Nmap aggressive  every nmap_aggressive_interval (default 360s)
-  mDNS discovery   every mdns_interval         (default 120s, global)
+  mDNS discovery   every mdns_interval          (default 120s, global)
+  DHCP sniffing    continuous, drained every dhcp_drain_interval (default 60s)
+  SSDP discovery   every ssdp_interval          (default 180s, global)
+  LLMNR discovery  every llmnr_interval         (default 90s, global)
 
-Learning-mode auto-start (bugfix, this revision):
+Npcap check (this revision):
+  On Windows, checks for Npcap (required for Scapy's raw ARP scanning)
+  and silently installs it if missing — fully non-interactive, no
+  prompts. See utils/npcap_installer.py's module docstring for why this
+  now also matters for Linux/macOS correctness (a prior bug there would
+  have crashed the import chain on non-Windows entirely). If Npcap is
+  required and could not be made available (e.g. missing admin rights,
+  download failure), Cerberus exits rather than starting with a scanner
+  that can't actually capture packets — a silent partial-functionality
+  start would be more confusing than a clear failure at boot.
+
+Email Trust/Block links (this revision):
+  CerberusService is now constructed with link_secret=cfg.link_secret,
+  enabling the /confirm/trust/<token> routes in api/server.py. Without
+  this, those routes still exist but every request returns "Trust
+  links are not enabled" (service.verify_trust_token() checks for a
+  missing link_secret explicitly — see cerberus_service.py).
+
+Learning-mode auto-start (bugfix, carried from a previous revision):
   Previously, learning_mode.start() was called UNCONDITIONALLY on every
   launch — meaning if you deliberately stopped learning mode via the
   CLI (`learning stop`) and then restarted the scanner, it would
@@ -29,12 +51,26 @@ import argparse
 import logging
 import sys
 import os
+import signal
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cerberus.utils.logger import setup_logging
 from cerberus.utils.config_loader import get_config, ConfigError
+try:
+    from cerberus.utils.npcap_installer import handle_npcap_installation
+except ImportError:
+    # Per the project's own architectural rule ("npcap_installer.py
+    # never ships in the container image" — it's Windows-only and
+    # irrelevant on Linux), the Docker build's .dockerignore excludes
+    # this file entirely from the image. Without this try/except, that
+    # exclusion would break cerberus_main.py's own import chain and
+    # crash the container before it ever starts. handle_npcap_installation
+    # being None is the signal that this build simply doesn't include
+    # the check — main() below treats that as "nothing to do here,"
+    # not an error.
+    handle_npcap_installation = None
 from cerberus.storage.device_store import DeviceStore
 from cerberus.core.scheduler import Scheduler
 from cerberus.intelligence.trust_engine import TrustEngine
@@ -43,7 +79,6 @@ from cerberus.alerts.alert_manager import AlertManager
 from cerberus.alerts.email_alert import EmailAlert
 from cerberus.service.cerberus_service import CerberusService
 from cerberus.api.server import run_server
-from cerberus.utils.npcap_installer import handle_npcap_installation
 
 
 def _parse_args() -> argparse.Namespace:
@@ -74,6 +109,12 @@ def _parse_args() -> argparse.Namespace:
                         help="Thread pool size for aggressive scans (overrides config)")
     parser.add_argument("--mdns-interval", type=int, default=None,
                         help="Seconds between mDNS browse cycles (overrides config)")
+    parser.add_argument("--dhcp-drain-interval", type=int, default=None,
+                        help="Seconds between DHCP sighting drains (overrides config)")
+    parser.add_argument("--ssdp-interval", type=int, default=None,
+                        help="Seconds between SSDP browse cycles (overrides config)")
+    parser.add_argument("--llmnr-interval", type=int, default=None,
+                        help="Seconds between LLMNR resolve cycles (overrides config)")
     parser.add_argument("--learning-hours", type=int, default=None,
                         help="Learning mode window in hours (overrides config; "
                              "only applies on a genuine first-ever run or "
@@ -92,6 +133,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--no-mdns",       action="store_true",
                         help="Disable mDNS discovery even if "
                              "mdns_enabled is true in config")
+    parser.add_argument("--no-dhcp",       action="store_true",
+                        help="Disable DHCP sniffing even if "
+                             "dhcp_enabled is true in config")
+    parser.add_argument("--no-ssdp",       action="store_true",
+                        help="Disable SSDP discovery even if "
+                             "ssdp_enabled is true in config")
+    parser.add_argument("--no-llmnr",      action="store_true",
+                        help="Disable LLMNR discovery even if "
+                             "llmnr_enabled is true in config")
+    parser.add_argument("--no-npcap-check", action="store_true",
+                        help="Skip the Npcap check entirely on Windows "
+                             "(advanced — only if you've verified it "
+                             "yourself, or are troubleshooting)")
     parser.add_argument("--config",        default=None,
                         help="Path to config.json (default: config/config.json)")
     return parser.parse_args()
@@ -108,7 +162,7 @@ def _print_banner(logger: logging.Logger) -> None:
     logger.info("""
 ╔══════════════════════════════════════════════════════╗
 ║          CERBERUS v2 — The Network Sentinel          ║
-║          Three-Tier Aggressive Scanner               ║
+║          Three-Tier Aggressive Scanner                ║
 ╚══════════════════════════════════════════════════════╝""")
 
 
@@ -132,11 +186,12 @@ def _print_summary(store: DeviceStore, logger: logging.Logger) -> None:
                 acc     = d.get("os_accuracy")
                 acc_str = f" ({acc}%)" if acc else ""
                 label   = f" [{d['label']}]" if d.get("label") else ""
+                model   = f" ({d['model']})" if d.get("model") else ""
                 ports   = d.get("open_ports") or []
                 svc     = d.get("services") or {}
                 logger.info(
                     f"  {d['ip']:<16} {d['mac']}  "
-                    f"{vendor:<22} {os_name}{acc_str}  [{tag}]{label}"
+                    f"{vendor:<22}{model} {os_name}{acc_str}  [{tag}]{label}"
                 )
                 for port in ports[:8]:
                     s = svc.get(port, svc.get(str(port), {}))
@@ -202,7 +257,30 @@ def _handle_learning_mode_startup(
         )
 
 
+def _install_sigterm_handler() -> None:
+    """
+    Translate SIGTERM into the SAME graceful-shutdown path already
+    correctly handled for Ctrl+C (SIGINT) below, rather than
+    duplicating the cleanup logic.
+
+    Why this matters (Docker specifically): `docker stop` sends
+    SIGTERM by default, waits a grace period (10s unless configured
+    otherwise), then sends SIGKILL if the process hasn't exited.
+    Python's default disposition for SIGTERM is immediate termination
+    — it does NOT raise a catchable exception unless a handler is
+    installed. Without this, `docker stop` would kill Cerberus before
+    scheduler.stop() (which joins every worker thread), _print_summary(),
+    or service.close() (clean SQLite close) ever ran — every container
+    stop would look like a crash, not a shutdown, even though nothing
+    was actually wrong.
+    """
+    def _handle_sigterm(signum, frame):
+        raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+
 def main() -> None:
+    _install_sigterm_handler()
     args = _parse_args()
 
     try:
@@ -220,6 +298,9 @@ def main() -> None:
     nmap_aggressive_interval = args.nmap_aggressive_interval or cfg.nmap_aggressive_interval
     aggressive_workers       = args.aggressive_workers       or cfg.aggressive_workers
     mdns_interval            = args.mdns_interval            or cfg.mdns_interval
+    dhcp_drain_interval      = args.dhcp_drain_interval      or cfg.dhcp_drain_interval
+    ssdp_interval            = args.ssdp_interval            or cfg.ssdp_interval
+    llmnr_interval           = args.llmnr_interval           or cfg.llmnr_interval
     learning_hours           = args.learning_hours           or cfg.learning_mode_hours
 
     _ensure_dirs(db_path, log_file)
@@ -229,15 +310,32 @@ def main() -> None:
         silent_mode=args.silent,
     )
 
-    api_will_run  = cfg.api_enabled  and not args.no_api
-    mdns_will_run = cfg.mdns_enabled and not args.no_mdns
-
     _print_banner(logger)
-    
-    # Npcap check — Windows-only, no-ops cleanly on Linux/macOS
-    if not handle_npcap_installation():
-        logger.critical("Npcap unavailable and required for scanning. Exiting.")
-        sys.exit(1)
+
+    # --- Npcap check (Windows-only in effect; instant no-op elsewhere) ---
+    if handle_npcap_installation is None:
+        logger.debug(
+            "npcap_installer module not present in this build "
+            "(expected in container images — Windows-only, excluded by design)."
+        )
+    elif not args.no_npcap_check:
+        if not handle_npcap_installation():
+            logger.critical(
+                "Npcap is required for scanning on Windows and could not be "
+                "made available. Re-run as Administrator, install Npcap "
+                "manually (https://npcap.com/#download), or pass "
+                "--no-npcap-check if you've already verified capture works. "
+                "Exiting."
+            )
+            sys.exit(1)
+    else:
+        logger.warning("Npcap check skipped (--no-npcap-check).")
+
+    api_will_run   = cfg.api_enabled  and not args.no_api
+    mdns_will_run  = cfg.mdns_enabled and not args.no_mdns
+    dhcp_will_run  = cfg.dhcp_enabled and not args.no_dhcp
+    ssdp_will_run  = cfg.ssdp_enabled and not args.no_ssdp
+    llmnr_will_run = cfg.llmnr_enabled and not args.no_llmnr
 
     logger.info(f"DB                  : {db_path}")
     logger.info(f"Config file         : {args.config or 'config/config.json'}")
@@ -246,8 +344,12 @@ def main() -> None:
     logger.info(f"Nmap aggressive     : {nmap_aggressive_interval}s "
                 f"({aggressive_workers} workers)")
     logger.info(f"mDNS discovery      : {'ON every ' + str(mdns_interval) + 's' if mdns_will_run else 'OFF'}")
+    logger.info(f"DHCP sniffing       : {'ON, drained every ' + str(dhcp_drain_interval) + 's' if dhcp_will_run else 'OFF'}")
+    logger.info(f"SSDP discovery      : {'ON every ' + str(ssdp_interval) + 's' if ssdp_will_run else 'OFF'}")
+    logger.info(f"LLMNR discovery     : {'ON every ' + str(llmnr_interval) + 's' if llmnr_will_run else 'OFF'}")
     logger.info(f"Email alerts        : {'ON' if cfg.email_alerts_enabled else 'OFF'}")
     logger.info(f"Alert pipeline      : {'OFF (--no-alerts)' if args.no_alerts else 'ON'}")
+    logger.info(f"Trust/Block links   : {'ON' if cfg.link_secret else 'OFF (no link_secret)'}")
     logger.info(f"API server          : {'ON at ' + cfg.api_host + ':' + str(cfg.api_port) if api_will_run else 'OFF'}")
     if api_will_run and not cfg.api_secret_key:
         logger.warning(
@@ -267,7 +369,7 @@ def main() -> None:
         learning_mode = LearningMode(
             device_store=store,
             duration_hours=learning_hours,
-            state_file="data/learning_mode.json",
+            state_file=cfg.learning_mode_state_file,
         )
         _handle_learning_mode_startup(learning_mode, args, logger)
         lm_s = learning_mode.status()
@@ -294,15 +396,23 @@ def main() -> None:
         aggressive_workers=aggressive_workers,
         mdns_enabled=mdns_will_run,
         mdns_interval=mdns_interval,
+        dhcp_enabled=dhcp_will_run,
+        dhcp_drain_interval=dhcp_drain_interval,
+        ssdp_enabled=ssdp_will_run,
+        ssdp_interval=ssdp_interval,
+        llmnr_enabled=llmnr_will_run,
+        llmnr_interval=llmnr_interval,
     )
 
-    # --- Service seam — EVERYTHING attached ---
+    # --- Service seam — EVERYTHING attached, including Trust-link secret ---
     service = CerberusService(
         device_store=store,
         trust_engine=trust_engine,
         alert_manager=alert_manager,
         scheduler=scheduler,
         learning_mode=learning_mode,
+        link_secret=cfg.link_secret,
+        link_token_expiry_hours=cfg.link_token_expiry_hours,
     )
 
     # --- Embedded API server ---
@@ -332,7 +442,7 @@ def main() -> None:
         logger.info("Cerberus shutting down...")
         scheduler.stop()
         _print_summary(store, logger)
-        store.close()
+        service.close()
         logger.info("Cerberus offline. Goodbye.")
 
 

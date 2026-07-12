@@ -1,0 +1,82 @@
+version: "3.8"
+
+# Cerberus v2 — two services, per the README's Phase 4 design:
+#
+#   cerberus-core     The scanner + embedded API server. Uses HOST
+#                     networking and NET_RAW/NET_ADMIN capabilities —
+#                     this is not optional. Real ARP scanning needs to
+#                     see your actual LAN; Docker's default bridge
+#                     network would isolate this container onto its
+#                     own private virtual subnet, where it could only
+#                     ever discover itself and other containers, never
+#                     your real devices. This is the same failure mode
+#                     flagged in the original README for this exact
+#                     reason.
+#
+#   cerberus-frontend The dashboard. No special privileges — it's a
+#                     static site that talks to the API over the
+#                     network like any browser would, not something
+#                     that needs to see raw packets itself.
+#
+# Because cerberus-core uses host networking, it does NOT get a normal
+# Docker-internal hostname the frontend could reach it by (host-network
+# containers share the host's network namespace directly, bypassing
+# Compose's internal bridge/DNS entirely). This is why the frontend
+# needs CERBERUS_PUBLIC_URL (your host machine's actual LAN IP) rather
+# than a service name like "http://cerberus-core:5000" — the same
+# constraint already documented in .env.example for the email Trust
+# links, now applying here too.
+
+services:
+  cerberus-core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cerberus-core
+    network_mode: host
+    cap_add:
+      - NET_RAW      # raw packet capture — Scapy's ARP scanning needs this
+      - NET_ADMIN    # interface-level operations some scan paths need
+    env_file:
+      - .env
+    volumes:
+      # Bind mounts, not named volumes — these are your actual runtime
+      # state (device DB, learning-mode state, logs, editable config).
+      # A named volume would work too, but a bind mount to plain host
+      # directories is easier to inspect/back up directly, and matches
+      # how you'd already been running this outside Docker.
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./config:/app/config
+    restart: unless-stopped
+    healthcheck:
+      # Uses Python (already in the image) instead of curl, to avoid
+      # installing an extra package just for this one check.
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  cerberus-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Read from your .env at BUILD time (see frontend/Dockerfile's
+        # comment on why these must be build args, not runtime env
+        # vars, for a Vite app). Defaults here are placeholders —
+        # override them in .env for anything beyond local-machine use.
+        VITE_API_BASE_URL: ${CERBERUS_PUBLIC_URL:-http://localhost:5000}
+        VITE_API_KEY: ${CERBERUS_API_SECRET:-}
+    container_name: cerberus-frontend
+    ports:
+      - "${CERBERUS_FRONTEND_PORT:-8080}:80"
+    depends_on:
+      cerberus-core:
+        condition: service_healthy
+    restart: unless-stopped
+    # CRITICAL FIX FOR WINDOWS/WSL2 DOCKER NETWORKING:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

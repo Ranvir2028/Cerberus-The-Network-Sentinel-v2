@@ -25,6 +25,16 @@ Rules:
     pattern as everything else. See learning_mode.py's cross-process
     sync note for why stop_learning_mode() called from a CLI process
     can still affect a scanner running in a different process.
+
+Trust-link token redemption (this revision):
+  verify_trust_token() / redeem_trust_token() give api/server.py's
+  /confirm/trust/<token> routes a way to check and act on email Trust
+  links WITHOUT that file ever importing utils/link_tokens or
+  storage/device_store directly — the "never touches storage directly"
+  rule for CLI/API applies here too, token verification is no
+  exception. link_secret is INJECTED at construction (by whoever builds
+  this service — cerberus_main.py), never read from config here, same
+  injection pattern as every other optional dependency below.
 """
 
 import logging
@@ -32,6 +42,9 @@ from typing import List, Dict, Optional
 
 from cerberus.storage.device_store import DeviceStore
 from cerberus.intelligence.trust_engine import TrustEngine
+from cerberus.utils import config_loader as _config_loader
+from cerberus.utils.link_tokens import generate_token as _generate_link_token
+from cerberus.utils.link_tokens import verify_token as _verify_link_token, TokenError
 
 logger = logging.getLogger("cerberus.service.cerberus_service")
 
@@ -48,6 +61,7 @@ class CerberusService:
             alert_manager=alert_manager,   # optional
             scheduler=scheduler,           # optional, for get_scan_status()
             learning_mode=learning_mode,   # optional, for learning-mode controls
+            link_secret=cfg.link_secret,   # optional, for Trust-link redemption
         )
         devices = service.get_devices()
         service.trust_device("aa:bb:cc:dd:ee:ff")
@@ -60,18 +74,23 @@ class CerberusService:
         alert_manager                       = None,
         scheduler                           = None,
         learning_mode                       = None,
+        link_secret:   Optional[str]        = None,
+        link_token_expiry_hours: int        = 72,
     ):
         self._store         = device_store
         self._trust_engine   = trust_engine or TrustEngine()
         self._alert_manager  = alert_manager   # None = trust ops won't clear cooldowns
         self._scheduler       = scheduler        # None = get_scan_status() returns a stub
         self._learning_mode    = learning_mode     # None = learning-mode methods return stubs
+        self._link_secret      = link_secret       # None = trust-link/identify-link redemption unavailable
+        self._link_token_expiry_hours = link_token_expiry_hours
 
         logger.info(
             f"CerberusService ready — "
             f"alert_manager={'attached' if alert_manager else 'none'} | "
             f"scheduler={'attached' if scheduler else 'none'} | "
-            f"learning_mode={'attached' if learning_mode else 'none'}"
+            f"learning_mode={'attached' if learning_mode else 'none'} | "
+            f"trust_links={'enabled' if link_secret else 'disabled'}"
         )
 
     # ------------------------------------------------------------------
@@ -159,6 +178,14 @@ class CerberusService:
     def get_alert_counts(self) -> Dict[str, int]:
         """Lifetime alert counts — {total, new_unknown, returning_unknown}."""
         return self._store.alert_counts()
+
+    def delete_alert(self, alert_id: int) -> bool:
+        """Delete one alert from the persistent log. False if not found."""
+        return self._store.delete_alert(alert_id)
+
+    def clear_alerts(self) -> int:
+        """Delete ALL alerts from the persistent log. Returns count deleted."""
+        return self._store.clear_alerts()
 
     def get_alert_manager_status(self) -> Dict:
         """
@@ -286,6 +313,390 @@ class CerberusService:
         return status
 
     # ------------------------------------------------------------------
+    # Trust-link token redemption (this revision)
+    # ------------------------------------------------------------------
+
+    def verify_trust_token(self, token: str) -> Dict:
+        """
+        Check a Trust-confirmation token's signature, expiry, and
+        redemption status WITHOUT redeeming it. Used by api/server.py's
+        GET /confirm/trust/<token> route to render the confirmation
+        page — the operator sees device info and a "Confirm Trust"
+        button before anything is actually changed. GET requests must
+        never have side effects; this method guarantees that by
+        design (it never calls device_store.mark_token_used or
+        trust_device).
+
+        Returns a dict, always with a "valid" key:
+            {"valid": False, "reason": "unavailable", ...}
+                — no link_secret was configured for this service
+                  instance (Trust links were never enabled).
+            {"valid": False, "reason": "malformed"|"bad_signature"|"expired", ...}
+                — token failed cryptographic/expiry verification.
+            {"valid": True, "reason": None, "mac": ..., "token_id": ...,
+             "purpose": ..., "expires_at": ..., "already_used": bool,
+             "device": Optional[Dict]}
+                — token is genuine; "already_used" and "device" tell
+                  the caller what to actually show/offer.
+        """
+        if not self._link_secret:
+            return {
+                "valid": False, "reason": "unavailable",
+                "mac": None, "already_used": False, "device": None,
+            }
+
+        try:
+            payload = _verify_link_token(token, secret=self._link_secret)
+        except TokenError as e:
+            return {
+                "valid": False, "reason": e.reason,
+                "mac": None, "already_used": False, "device": None,
+            }
+
+        already_used = self._store.is_token_used(payload.token_id)
+        device = self._store.get(payload.mac)
+
+        return {
+            "valid": True,
+            "reason": None,
+            "mac": payload.mac,
+            "token_id": payload.token_id,
+            "purpose": payload.purpose,
+            "expires_at": payload.expires_at,
+            "already_used": already_used,
+            "device": device,
+        }
+
+    def redeem_trust_token(self, token: str) -> Dict:
+        """
+        Verify AND redeem a Trust-confirmation token — this is the
+        method with real side effects, called ONLY from api/server.py's
+        POST /confirm/trust/<token> route (never GET). On success, marks
+        the token used (device_store.mark_token_used — atomic, so a
+        raced double-submit can only ever succeed once) and marks the
+        device trusted via trust_device() (which also clears any active
+        alert cooldown, same as a manual dashboard trust action).
+
+        Returns a dict, always with a "success" key:
+            {"success": False, "reason": "unavailable"|"malformed"|
+             "bad_signature"|"expired"|"already_used"|
+             "device_not_found"|"trust_failed",
+             "mac": Optional[str], "display_name": Optional[str]}
+            {"success": True, "reason": None,
+             "mac": str, "display_name": str}
+        """
+        check = self.verify_trust_token(token)
+
+        if not check["valid"]:
+            return {
+                "success": False, "reason": check["reason"],
+                "mac": None, "display_name": None,
+            }
+
+        mac = check["mac"]
+        device = check["device"]
+        display_name = (
+            (device.get("label") or device.get("hostname") or device.get("vendor") or mac)
+            if device else mac
+        )
+
+        if check["already_used"]:
+            return {
+                "success": False, "reason": "already_used",
+                "mac": mac, "display_name": display_name,
+            }
+
+        if not device:
+            return {
+                "success": False, "reason": "device_not_found",
+                "mac": mac, "display_name": mac,
+            }
+
+        # Atomic redemption — if a concurrent request already marked
+        # this token used between verify_trust_token() above and this
+        # call, mark_token_used() returns False and we correctly report
+        # "already_used" rather than double-trusting the device.
+        marked = self._store.mark_token_used(
+            token_id=check["token_id"],
+            mac=mac,
+            purpose=check["purpose"],
+            expires_at=check["expires_at"],
+        )
+        if not marked:
+            return {
+                "success": False, "reason": "already_used",
+                "mac": mac, "display_name": display_name,
+            }
+
+        trusted = self.trust_device(mac)
+        if not trusted:
+            # Extremely unlikely (device existed a moment ago in the
+            # verify step) but handle it rather than claim false success.
+            return {
+                "success": False, "reason": "trust_failed",
+                "mac": mac, "display_name": display_name,
+            }
+
+        logger.info(f"[trust-link] Redeemed — {mac} ({display_name}) marked trusted.")
+        return {
+            "success": True, "reason": None,
+            "mac": mac, "display_name": display_name,
+        }
+
+    # ------------------------------------------------------------------
+    # Device self-identification links (this revision)
+    # ------------------------------------------------------------------
+    #
+    # Design note: unlike the Trust links above (which the operator
+    # never directly triggers per-device — alert_manager generates one
+    # automatically per alert), an identify link is explicitly
+    # operator-triggered from the dashboard, ONE DEVICE AT A TIME, via
+    # a "Request ID" button. This directly answers "how does the
+    # recipient know which device is theirs" — they don't need to,
+    # because the link ITSELF already names the device (the MAC is
+    # bound into the token's signature at generation time, same as
+    # Trust tokens). The recipient never needs to know their own IP or
+    # MAC; they just see a page asking "is this device yours?" and
+    # type a name if so.
+    #
+    # Cerberus never sends this link anywhere itself — request_
+    # identify_link() only ISSUES the token; delivering it (text,
+    # WhatsApp, in person, whatever) is entirely the operator's own
+    # action, by design. This keeps the feature squarely in "a tool
+    # that helps the operator label their own network," not anything
+    # that reaches out to a device on its own.
+    #
+    # Submitting a name here ONLY sets the label — it never marks the
+    # device trusted. Trust remains a separate, operator-only action.
+
+    def request_identify_link(self, mac: str) -> Dict:
+        """
+        Issue a fresh signed, single-use, time-limited "identify
+        yourself" token for one specific device. Called from the
+        dashboard's per-device "Request ID" button.
+
+        Args:
+            mac: The device this link will ask about. Bound into the
+                 token's signature — cannot be changed after issuance
+                 without invalidating the token.
+
+        Returns:
+            {"success": True, "mac": ..., "display_name": ..., "token": ...}
+                — caller (api/server.py) builds the full shareable URL
+                  from this token, since it has the current request's
+                  own host/port context, which is simpler and more
+                  reliable than this service trying to guess a public
+                  base URL for a dashboard-triggered action.
+            {"success": False, "reason": "unavailable"} if no
+                  link_secret is configured for this service instance.
+            {"success": False, "reason": "device_not_found"} if the MAC
+                  isn't in device_store at all.
+        """
+        if not self._link_secret:
+            return {"success": False, "reason": "unavailable"}
+
+        device = self._store.get(mac)
+        if not device:
+            return {"success": False, "reason": "device_not_found"}
+
+        display_name = device.get("label") or device.get("hostname") or device.get("vendor") or mac
+
+        try:
+            token, token_id, expires_at = _generate_link_token(
+                mac=mac,
+                purpose="identify",
+                secret=self._link_secret,
+                expiry_hours=self._link_token_expiry_hours,
+            )
+        except Exception as e:
+            logger.error(f"[identify-link] Failed to generate token for {mac}: {e}")
+            return {"success": False, "reason": "token_generation_failed"}
+
+        logger.info(f"[identify-link] Issued — mac={mac} token_id={token_id} expires={expires_at}")
+        return {
+            "success": True,
+            "mac": mac,
+            "display_name": display_name,
+            "token": token,
+            "expires_at": expires_at,
+        }
+
+    def verify_identify_token(self, token: str) -> Dict:
+        """
+        Check an identify token's signature/expiry/redemption status
+        WITHOUT redeeming it — used by the GET confirmation page so a
+        mere page load never has side effects (same reasoning as
+        verify_trust_token — see that method for the full explanation
+        of why GET must stay side-effect-free).
+
+        Returns a dict shaped like verify_trust_token()'s, with the
+        same "valid"/"reason"/"already_used"/"device" keys — kept
+        deliberately identical in shape so api/server.py's page
+        rendering can share logic between the Trust and Identify flows
+        rather than needing two parallel implementations.
+        """
+        if not self._link_secret:
+            return {
+                "valid": False, "reason": "unavailable",
+                "mac": None, "already_used": False, "device": None,
+            }
+
+        try:
+            payload = _verify_link_token(token, secret=self._link_secret)
+        except TokenError as e:
+            return {
+                "valid": False, "reason": e.reason,
+                "mac": None, "already_used": False, "device": None,
+            }
+
+        if payload.purpose != "identify":
+            # A Trust token used on the Identify route (or vice versa)
+            # must be rejected — the signature is valid but for the
+            # wrong purpose. Treated as malformed rather than exposing
+            # which specific purpose mismatch occurred.
+            return {
+                "valid": False, "reason": "malformed",
+                "mac": None, "already_used": False, "device": None,
+            }
+
+        already_used = self._store.is_token_used(payload.token_id)
+        device = self._store.get(payload.mac)
+
+        return {
+            "valid": True,
+            "reason": None,
+            "mac": payload.mac,
+            "token_id": payload.token_id,
+            "purpose": payload.purpose,
+            "expires_at": payload.expires_at,
+            "already_used": already_used,
+            "device": device,
+        }
+
+    def redeem_identify_link(self, token: str, name: str) -> Dict:
+        """
+        Verify AND redeem an identify token, setting the device's label
+        to the submitted name. Called ONLY from the POST route — never
+        GET. Atomic against double-submission via the same
+        mark_token_used() UNIQUE-constraint mechanism trust tokens use.
+
+        Args:
+            token: The token from the link.
+            name : The name the person typed in. Empty/whitespace-only
+                   is rejected — an empty label is not a meaningful
+                   identification and would be indistinguishable from
+                   "never identified" in the dashboard.
+
+        Returns:
+            {"success": False, "reason": "unavailable"|"malformed"|
+             "bad_signature"|"expired"|"already_used"|"device_not_found"|
+             "empty_name"|"label_failed",
+             "mac": Optional[str], "display_name": Optional[str]}
+            {"success": True, "reason": None,
+             "mac": str, "display_name": str}
+        """
+        name = (name or "").strip()
+
+        check = self.verify_identify_token(token)
+        if not check["valid"]:
+            return {
+                "success": False, "reason": check["reason"],
+                "mac": None, "display_name": None,
+            }
+
+        mac = check["mac"]
+        device = check["device"]
+        current_display_name = (
+            (device.get("label") or device.get("hostname") or device.get("vendor") or mac)
+            if device else mac
+        )
+
+        if check["already_used"]:
+            return {
+                "success": False, "reason": "already_used",
+                "mac": mac, "display_name": current_display_name,
+            }
+
+        if not device:
+            return {
+                "success": False, "reason": "device_not_found",
+                "mac": mac, "display_name": mac,
+            }
+
+        if not name:
+            return {
+                "success": False, "reason": "empty_name",
+                "mac": mac, "display_name": current_display_name,
+            }
+
+        marked = self._store.mark_token_used(
+            token_id=check["token_id"],
+            mac=mac,
+            purpose=check["purpose"],
+            expires_at=check["expires_at"],
+        )
+        if not marked:
+            return {
+                "success": False, "reason": "already_used",
+                "mac": mac, "display_name": current_display_name,
+            }
+
+        labeled = self.label_device(mac, name)
+        if not labeled:
+            return {
+                "success": False, "reason": "label_failed",
+                "mac": mac, "display_name": current_display_name,
+            }
+
+        logger.info(f"[identify-link] Redeemed — {mac} labeled '{name}'.")
+        return {
+            "success": True, "reason": None,
+            "mac": mac, "display_name": name,
+        }
+
+    # ------------------------------------------------------------------
+    # Settings (this revision)
+    # ------------------------------------------------------------------
+    #
+    # Scoped exception to "owns zero logic of its own, never reads
+    # config directly" above: settings ARE a piece of system state,
+    # analogous to scan/alert-manager/learning-mode status already
+    # exposed elsewhere in this class — the actual read/write logic,
+    # the secrets whitelist, and the atomic-reject-on-invalid-key
+    # guarantee all live in config_loader.py; this is a thin dispatch
+    # into that, same pattern as everything else here.
+
+    def get_settings(self) -> Dict:
+        """
+        Current editable (non-secret) settings, plus configured/not-
+        configured indicators for every secret (never the secret
+        values themselves). See config_loader.py's editable-settings
+        section for the full whitelist and the reasoning behind it.
+        """
+        return {
+            "editable": _config_loader.get_editable_settings(),
+            "secrets": _config_loader.get_settings_status(),
+        }
+
+    def update_settings(self, updates: Dict) -> Dict:
+        """
+        Apply a settings update. Rejected ATOMICALLY (nothing partially
+        applied) if `updates` contains any key outside the editable
+        whitelist — see config_loader.update_editable_settings().
+
+        Returns:
+            {"success": True, "settings": {...}} on success.
+            {"success": False, "reason": "..."} if an invalid key was
+            present — reason is a human-readable message naming which
+            key(s) aren't editable, safe to show directly in the UI.
+        """
+        try:
+            merged = _config_loader.update_editable_settings(updates)
+            return {"success": True, "settings": merged}
+        except ValueError as e:
+            return {"success": False, "reason": str(e)}
+
+    # ------------------------------------------------------------------
     # Combined snapshot — convenience for dashboards / CLI "status" command
     # ------------------------------------------------------------------
 
@@ -303,6 +714,23 @@ class CerberusService:
             "learning_mode": self.get_learning_mode_status(),
             "scan":          self.get_scan_status(),
         }
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        """
+        Close the underlying device_store connection. Added this
+        revision — previously, cli/terminal.py reached into
+        service._store.close() directly, which violated the seam rule
+        ("CLI and frontend only ever talk to service/ — never storage,
+        scanners, or intelligence directly") from OUTSIDE this file.
+        cli/terminal.py's main() should be updated to call
+        service.close() instead of service._store.close().
+        """
+        self._store.close()
+        logger.debug("CerberusService closed (device_store connection closed).")
 
 
 # ---------------------------------------------------------------------------
@@ -419,11 +847,26 @@ if __name__ == "__main__":
         assert "devices" in full and "alerts" in full and "learning_mode" in full
         print(f"[PASS] get_full_status() → keys: {list(full.keys())}")
 
+        # --- Trust-link token redemption — no link_secret attached ---
+        check_unavail = service.verify_trust_token("whatever")
+        assert check_unavail["valid"] is False
+        assert check_unavail["reason"] == "unavailable"
+        print("[PASS] verify_trust_token() with no link_secret → 'unavailable'")
+
+        redeem_unavail = service.redeem_trust_token("whatever")
+        assert redeem_unavail["success"] is False
+        assert redeem_unavail["reason"] == "unavailable"
+        print("[PASS] redeem_trust_token() with no link_secret → 'unavailable'")
+
         # --- delete_device ---
         ok = service.delete_device("aa:bb:cc:dd:ee:02")
         assert ok is True
         assert service.get_device("aa:bb:cc:dd:ee:02") is None
         print("[PASS] delete_device() → device removed")
 
-        store.close()
-        print("\nAll assertions passed.")
+        # --- close() ---
+        service.close()
+        print("[PASS] close() succeeded")
+
+        print("\nAll assertions passed (link_secret-attached path tested separately "
+              "in api/server.py's integration test).")

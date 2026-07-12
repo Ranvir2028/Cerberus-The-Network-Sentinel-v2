@@ -148,3 +148,81 @@ Two containers: core+API (needs --network host and NET_RAW capability to see you
 #### 18. `Multi-segment scan policy` — which subnets get scanned at what depth; an org has segments (production VLANs) you explicitly do not want deep-Nmap'd by default.
 
 #### 19. `Auth on API/frontend` — irrelevant solo, mandatory the moment a second person can view the dashboard.
+
+
+
+
+cerberus_v2/
+├── cerberus/
+│   ├── __init__.py
+│   ├── detection/
+│   │   ├── __init__.py
+│   │   ├── router_detector.py
+│   │   ├── vendor_lookup.py
+│   │   ├── mdns_discovery.py        ← UPDATED (TXT-record parsing)
+│   │   ├── dhcp_sniffer.py          ← NEW
+│   │   ├── ssdp_discovery.py        ← NEW
+│   │   └── llmnr_discovery.py       ← NEW
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── scanner_scapy.py
+│   │   ├── scanner_nmap.py
+│   │   └── scheduler.py             ← UPDATED (4 new discovery workers wired in)
+│   ├── intelligence/
+│   │   ├── __init__.py
+│   │   ├── trust_engine.py
+│   │   └── learning_mode.py
+│   ├── storage/
+│   │   ├── __init__.py
+│   │   └── device_store.py          ← UPDATED (tokens, model column, enrichment methods, alert delete, row-order bugfix)
+│   ├── alerts/
+│   │   ├── __init__.py
+│   │   ├── alert_manager.py         ← UPDATED (Trust/Block links, HTML+text AlertMessage)
+│   │   └── email_alert.py           ← UPDATED (multipart HTML email)
+│   ├── service/
+│   │   ├── __init__.py
+│   │   └── cerberus_service.py      ← UPDATED (trust/identify tokens, settings, close())
+│   ├── cli/
+│   │   ├── __init__.py
+│   │   └── terminal.py              ← UPDATED (seam fix, friendly errors)
+│   ├── api/
+│   │   ├── __init__.py
+│   │   └── server.py                ← UPDATED (confirm/trust, confirm/identify, settings, alert delete)
+│   └── utils/
+│       ├── __init__.py
+│       ├── logger.py
+│       ├── config_loader.py         ← UPDATED (many new fields + settings read/write)
+│       └── npcap_installer.py       ← UPDATED (non-interactive, cross-platform fix)
+├── frontend/
+│   ├── package.json
+│   ├── package-lock.json
+│   ├── vite.config.js
+│   ├── index.html
+│   ├── .gitignore
+│   ├── .env.example
+│   ├── .dockerignore                ← NEW
+│   ├── Dockerfile                   ← NEW
+│   └── src/
+│       ├── main.jsx
+│       ├── App.jsx                 ← UPDATED (now a thin wrapper)
+│       ├── Dashboard.jsx            ← NEW (the actual dashboard UI)
+│       ├── api.js                  ← UPDATED
+│       └── index.css               ← UPDATED (full HUD redesign)
+├── config/
+│   └── config.json                 (auto-managed, don't hand-edit while Cerberus is running)
+├── data/
+│   ├── devices.db
+│   ├── learning_mode.json
+│   └── oui.txt
+├── logs/
+│   └── cerberus.log
+├── cerberus_main.py                 ← UPDATED (npcap, SIGTERM, link_secret, discovery wiring)
+├── run_dev.py                       ← NEW (one-command local dev launcher)
+├── requirements.txt                 ← UPDATED (+requests)
+├── Dockerfile                       ← NEW (backend)
+├── docker-compose.yml               ← NEW
+├── .dockerignore                    ← NEW (root)
+├── .env                             (your real secrets — never commit)
+├── .env.example                     ← UPDATED (new vars documented)
+├── .gitignore                       (root)
+└── README.md                        (rewrite comes last, once everything's done)

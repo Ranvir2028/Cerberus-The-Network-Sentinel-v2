@@ -6,6 +6,10 @@ ONLY module in the entire project allowed to open a SQLite connection.
 
 Schema (Phase 1+2): devices, scan_history tables.
 Schema (Phase 3, module 13): alerts_log table for persistent alert history.
+Schema (email Trust/Block feature, this revision): used_tokens table —
+tracks single-use Trust confirmation tokens embedded in alert emails,
+so a token can only ever be redeemed once (protects against email
+prefetch scanners, forwarded emails, or a link being clicked twice).
 
 mDNS hostname enrichment: update_hostname_from_mdns() — only writes if
 the device currently has NO hostname. mDNS is a secondary signal, never
@@ -22,6 +26,19 @@ Nmap DID successfully identify, even if Cerberus's DB would give a
 differently-worded name for the same OUI.
 
 MAC normalization: all MACs stored and keyed lowercase.
+
+Trust-link token tracking (this revision):
+  utils/link_tokens.py generates a signed, time-limited token per MAC
+  when an alert email is composed. This module does NOT verify
+  signatures or expiry — that's link_tokens.py's job, since it's pure
+  crypto/logic with no DB dependency. This module's ONLY job is the
+  "single-use" half: recording that a specific token_id has been
+  redeemed, so a second click (or a prefetch-scanner's first click)
+  on the same link is rejected. mark_token_used() is atomic via
+  INSERT — a UNIQUE constraint on token_id means a race between two
+  near-simultaneous requests for the same token can only ever let one
+  succeed, the other gets a rowcount of 0 / IntegrityError, both
+  handled the same way: "already used."
 """
 
 import sqlite3
@@ -52,6 +69,8 @@ class DeviceStore:
         store.get_recent_alerts(limit=50)
         store.update_hostname_from_mdns(ip, hostname)
         store.update_vendor_if_missing(mac, vendor)
+        store.mark_token_used(token_id, mac, purpose, expires_at)
+        store.is_token_used(token_id)
     """
 
     def __init__(self, db_path: str = "data/devices.db"):
@@ -82,6 +101,7 @@ class DeviceStore:
         scanner     = device.get("scanner", "")
         vendor      = device.get("vendor")
         hostname    = device.get("hostname")
+        model       = device.get("model")
         os_name     = device.get("os")
         os_accuracy = device.get("os_accuracy")
         interface   = device.get("interface", "")
@@ -103,15 +123,15 @@ class DeviceStore:
             self._conn.execute(
                 """
                 INSERT OR IGNORE INTO devices
-                    (mac, ip, network, vendor, hostname, os, os_accuracy,
+                    (mac, ip, network, vendor, hostname, model, os, os_accuracy,
                      open_ports, services, http_title, ssh_hostkey, banners,
                      interface, scanner, trusted, first_seen, last_seen)
                 VALUES
-                    (?,   ?,  ?,       ?,      ?,        ?,  ?,
+                    (?,   ?,  ?,       ?,      ?,        ?,     ?,  ?,
                      ?,          ?,        ?,          ?,           ?,
                      ?,         ?,       0,       ?,          ?)
                 """,
-                (mac, ip, network, vendor, hostname, os_name, os_accuracy,
+                (mac, ip, network, vendor, hostname, model, os_name, os_accuracy,
                  open_ports, services_str, http_title, ssh_hostkey, banners_str,
                  interface, scanner, now, now),
             )
@@ -123,6 +143,7 @@ class DeviceStore:
                     network     = ?,
                     vendor      = COALESCE(?, vendor),
                     hostname    = COALESCE(?, hostname),
+                    model       = COALESCE(?, model),
                     os          = COALESCE(?, os),
                     os_accuracy = COALESCE(?, os_accuracy),
                     open_ports  = CASE WHEN ? != '' THEN ? ELSE open_ports END,
@@ -136,7 +157,7 @@ class DeviceStore:
                 WHERE mac = ?
                 """,
                 (ip, network,
-                 vendor, hostname, os_name, os_accuracy,
+                 vendor, hostname, model, os_name, os_accuracy,
                  open_ports, open_ports,
                  services_str, services_str,
                  http_title, ssh_hostkey,
@@ -278,6 +299,137 @@ class DeviceStore:
             logger.debug(f"[vendor-enrich] {mac} → {vendor}")
         return updated
 
+    def update_model_from_ip(self, ip: str, model: str) -> bool:
+        """
+        Set the hardware model string for whichever device currently
+        has this IP — but ONLY if it doesn't already have one. IP-keyed
+        (not MAC-keyed) because every source of model data so far
+        (mDNS TXT records, SSDP device descriptions) is an IP-layer
+        signal that never reveals a MAC — same reasoning as
+        update_hostname_from_mdns() being IP-keyed rather than MAC-keyed.
+
+        Used by scheduler for:
+          - mDNS's "model" field (detection/mdns_discovery.py TXT
+            record parsing — e.g. "iPhone14,5", "MacBookPro18,1")
+          - SSDP's "model_name" field (detection/ssdp_discovery.py
+            device description XML — e.g. "UN55MU8000")
+
+        Args:
+            ip    : IP address the sighting came from.
+            model : Model string from the discovery source.
+
+        Returns:
+            True if a device row was updated, False if no device
+            currently has this IP, it already had a model, or
+            ip/model was empty.
+        """
+        if not ip or not model:
+            return False
+
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE devices
+                SET model = ?
+                WHERE ip = ? AND (model IS NULL OR model = '')
+                """,
+                (model, ip),
+            )
+            self._conn.commit()
+
+        updated = cursor.rowcount > 0
+        if updated:
+            logger.debug(f"[model-enrich] {ip} → {model}")
+        return updated
+
+    def update_vendor_from_ip(self, ip: str, vendor: str) -> bool:
+        """
+        Set vendor for whichever device currently has this IP — but
+        ONLY if it doesn't already have one. IP-keyed sibling of
+        update_vendor_if_missing() (which is MAC-keyed, for the OUI
+        database backfill). This one exists specifically for SSDP's
+        "manufacturer" field (detection/ssdp_discovery.py device
+        description XML), which — like all SSDP/mDNS data — is an
+        IP-layer signal with no MAC attached.
+
+        Args:
+            ip     : IP address the sighting came from.
+            vendor : Vendor/manufacturer string from the discovery source.
+
+        Returns:
+            True if a device row was updated, False if no device
+            currently has this IP, it already had a vendor, or
+            ip/vendor was empty.
+        """
+        if not ip or not vendor:
+            return False
+
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE devices
+                SET vendor = ?
+                WHERE ip = ? AND (vendor IS NULL OR vendor = '')
+                """,
+                (vendor, ip),
+            )
+            self._conn.commit()
+
+        updated = cursor.rowcount > 0
+        if updated:
+            logger.debug(f"[vendor-enrich-ip] {ip} → {vendor}")
+        return updated
+
+    def update_hostname_by_mac(self, mac: str, hostname: str) -> bool:
+        """
+        Set hostname for a device by MAC — but ONLY if it doesn't
+        already have one. MAC-keyed (unlike update_hostname_from_mdns,
+        which is IP-keyed) because DHCP is the one discovery source
+        that gives us the device's real MAC directly, in the DHCP
+        packet itself — no IP-to-device guessing needed at all. This
+        makes DHCP-sourced hostnames the most reliable of the four
+        passive discovery signals (mDNS/SSDP/LLMNR are all IP-layer-
+        only and rely on whichever device currently holds that IP
+        being the right one).
+
+        If the MAC isn't in device_store yet (DHCP sighting arrived
+        before Scapy ever discovered this device via ARP), this
+        returns False and the sighting is simply not retried later —
+        see scheduler.py's DHCP drain worker for why this is an
+        accepted, deliberate simplification rather than a bug: in
+        practice a device that's actively doing DHCP negotiation is,
+        by definition, live on the network, so Scapy's ARP sweep
+        (running far more frequently than DHCP negotiations occur)
+        will almost always have already discovered it first.
+
+        Args:
+            mac      : Device MAC address (will be lowercased).
+            hostname : Hostname string from the DHCP sighting.
+
+        Returns:
+            True if a device row was updated, False if the MAC is
+            unknown, it already had a hostname, or mac/hostname was empty.
+        """
+        if not mac or not hostname:
+            return False
+        mac = mac.lower()
+
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE devices
+                SET hostname = ?
+                WHERE mac = ? AND (hostname IS NULL OR hostname = '')
+                """,
+                (hostname, mac),
+            )
+            self._conn.commit()
+
+        updated = cursor.rowcount > 0
+        if updated:
+            logger.debug(f"[dhcp-enrich] {mac} → {hostname}")
+        return updated
+
     def delete(self, mac: str) -> bool:
         """Remove a device and its history. Returns False if not found."""
         mac = mac.lower()
@@ -362,14 +514,14 @@ class DeviceStore:
         """Most recent fired alerts, newest first."""
         rows = self._conn.execute(
             """
-            SELECT mac, ip, network, verdict, message_summary, channels_fired, fired_at
+            SELECT id, mac, ip, network, verdict, message_summary, channels_fired, fired_at
             FROM alerts_log
             ORDER BY fired_at DESC
             LIMIT ?
             """,
             (limit,),
         ).fetchall()
-        cols = ["mac", "ip", "network", "verdict", "message_summary", "channels_fired", "fired_at"]
+        cols = ["id", "mac", "ip", "network", "verdict", "message_summary", "channels_fired", "fired_at"]
         return [dict(zip(cols, r)) for r in rows]
 
     def alert_counts(self) -> Dict[str, int]:
@@ -388,6 +540,165 @@ class DeviceStore:
             "new_unknown":        row[1] or 0,
             "returning_unknown":  row[2] or 0,
         }
+
+    def delete_alert(self, alert_id: int) -> bool:
+        """
+        Delete one alert from the persistent log by its id (this
+        revision — id is now included in get_recent_alerts()'s output
+        specifically so the frontend can reference a single alert for
+        deletion). Returns False if no alert with that id exists.
+
+        Note: this deletes from the AUDIT LOG (alerts_log), not
+        anything related to trust/cooldown state — deleting an alert
+        record has no effect on whether that device gets alerted on
+        again in the future. It's purely "stop showing me this old
+        entry," nothing more.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM alerts_log WHERE id = ?", (alert_id,)
+            )
+            self._conn.commit()
+
+        deleted = cursor.rowcount > 0
+        if deleted:
+            logger.info(f"[alert] Deleted alert id={alert_id}")
+        return deleted
+
+    def clear_alerts(self) -> int:
+        """
+        Delete ALL alerts from the persistent log. Used by the
+        dashboard's "clear all" action. Returns the number of rows
+        deleted, purely for a confirmation message — no other
+        significance.
+        """
+        with self._lock:
+            cursor = self._conn.execute("DELETE FROM alerts_log")
+            self._conn.commit()
+
+        deleted = cursor.rowcount
+        logger.info(f"[alert] Cleared all alerts ({deleted} row(s)).")
+        return deleted
+
+    # ------------------------------------------------------------------
+    # Public API — Trust-link token tracking (this revision)
+    # ------------------------------------------------------------------
+
+    def mark_token_used(
+        self,
+        token_id: str,
+        mac: str,
+        purpose: str = "trust",
+        expires_at: Optional[str] = None,
+    ) -> bool:
+        """
+        Record a token as redeemed. This is the ONLY write path for
+        used_tokens — there is no "unmark" method, by design: a
+        redeemed single-use token stays redeemed forever.
+
+        Atomic via INSERT with a UNIQUE constraint on token_id: if two
+        requests for the same token arrive nearly simultaneously (e.g.
+        a legitimate click racing an email-prefetch scanner's fetch),
+        SQLite guarantees only one INSERT succeeds. The other raises
+        sqlite3.IntegrityError, which this method catches and treats
+        identically to "already used" — the caller (api/server.py)
+        doesn't need to distinguish a genuine race from a later replay.
+
+        Args:
+            token_id   : Unique token identifier (the token's embedded
+                         nonce/jti — NOT the full signed token string;
+                         see utils/link_tokens.py for what this is).
+            mac        : MAC address the token was issued for (stored
+                         for audit/debugging, not used for validation
+                         here — link_tokens.py already bound the MAC
+                         into the signature).
+            purpose    : What action this token authorizes — "trust"
+                         for now, room to extend later without a schema
+                         change.
+            expires_at : ISO timestamp the token was valid until, for
+                         audit purposes only (this table's own row
+                         doesn't expire/get cleaned up based on this —
+                         see cleanup_expired_tokens()).
+
+        Returns:
+            True if this call newly marked the token as used (i.e. this
+            is the first redemption). False if the token was already
+            used previously (or by a concurrent racing request).
+        """
+        if not token_id:
+            logger.warning("mark_token_used called with empty token_id.")
+            return False
+
+        mac = (mac or "").lower()
+        now = _now()
+
+        with self._lock:
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO used_tokens
+                        (token_id, mac, purpose, used_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (token_id, mac, purpose, now, expires_at),
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError:
+                logger.info(
+                    f"[token] Redemption rejected — token already used "
+                    f"(mac={mac}, purpose={purpose})."
+                )
+                return False
+
+        logger.info(f"[token] Redeemed — mac={mac} purpose={purpose}")
+        return True
+
+    def is_token_used(self, token_id: str) -> bool:
+        """
+        Check whether a token has already been redeemed, WITHOUT
+        marking it used. Rarely needed directly — mark_token_used()
+        already does an atomic check-and-set in one call, which is
+        what api/server.py should normally use. This getter exists for
+        read-only status checks (e.g. showing "this link was already
+        used" on the confirmation page before the user even clicks the
+        confirm button, as a friendlier UX than only finding out on
+        submit).
+        """
+        if not token_id:
+            return False
+        row = self._conn.execute(
+            "SELECT 1 FROM used_tokens WHERE token_id = ?", (token_id,)
+        ).fetchone()
+        return row is not None
+
+    def cleanup_expired_tokens(self) -> int:
+        """
+        Delete used_tokens rows whose expires_at has passed. Purely
+        housekeeping — a used token past its expiry has no further
+        replay value (link_tokens.py's own signature verification
+        already rejects expired tokens regardless of what's in this
+        table), so this just keeps the table from growing forever.
+        Not called automatically anywhere yet; safe to wire into a
+        periodic maintenance task later if the table grows large.
+
+        Returns:
+            Number of rows deleted.
+        """
+        now = _now()
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                DELETE FROM used_tokens
+                WHERE expires_at IS NOT NULL AND expires_at < ?
+                """,
+                (now,),
+            )
+            self._conn.commit()
+
+        deleted = cursor.rowcount
+        if deleted:
+            logger.info(f"[token] Cleaned up {deleted} expired token record(s).")
+        return deleted
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -410,6 +721,22 @@ class DeviceStore:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        # Row factory gives name-based column access (row["mac"], dict(row))
+        # instead of position-based. This matters specifically because
+        # 'label' and 'model' were/are added via ALTER TABLE ADD COLUMN
+        # on any database that existed before those columns were part of
+        # CREATE TABLE — SQLite always appends ALTER-added columns at the
+        # PHYSICAL END of the table, regardless of where CREATE TABLE
+        # declares them for a fresh install. A hardcoded positional
+        # column list in _row_to_dict() would silently misalign every
+        # field on any database that went through that migration path
+        # (verified empirically while adding the 'model' column this
+        # revision — this was a real, live bug on any existing Cerberus
+        # database, not just a theoretical risk). Name-based access via
+        # sqlite3.Row is immune to physical column order entirely, no
+        # matter how many ALTER TABLE migrations a given database file
+        # has accumulated over time.
+        conn.row_factory = sqlite3.Row
         return conn
 
     def _init_schema(self) -> None:
@@ -422,6 +749,7 @@ class DeviceStore:
                     network     TEXT NOT NULL,
                     vendor      TEXT,
                     hostname    TEXT,
+                    model       TEXT,
                     os          TEXT,
                     os_accuracy INTEGER,
                     open_ports  TEXT,
@@ -458,6 +786,14 @@ class DeviceStore:
                     fired_at        TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS used_tokens (
+                    token_id    TEXT PRIMARY KEY,
+                    mac         TEXT NOT NULL,
+                    purpose     TEXT NOT NULL DEFAULT 'trust',
+                    used_at     TEXT NOT NULL,
+                    expires_at  TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_history_mac      ON scan_history(mac);
                 CREATE INDEX IF NOT EXISTS idx_history_seen_at  ON scan_history(seen_at);
                 CREATE INDEX IF NOT EXISTS idx_devices_trusted  ON devices(trusted);
@@ -465,6 +801,7 @@ class DeviceStore:
                 CREATE INDEX IF NOT EXISTS idx_devices_ip       ON devices(ip);
                 CREATE INDEX IF NOT EXISTS idx_alerts_fired_at  ON alerts_log(fired_at);
                 CREATE INDEX IF NOT EXISTS idx_alerts_mac       ON alerts_log(mac);
+                CREATE INDEX IF NOT EXISTS idx_tokens_expires   ON used_tokens(expires_at);
                 """
             )
             self._conn.commit()
@@ -478,13 +815,27 @@ class DeviceStore:
         except Exception:
             pass
 
+        try:
+            with self._lock:
+                self._conn.execute("ALTER TABLE devices ADD COLUMN model TEXT")
+                self._conn.commit()
+                logger.info("Migration: added 'model' column to devices table.")
+        except Exception:
+            pass
+
     def _row_to_dict(self, row) -> Dict:
-        cols = [
-            "mac", "ip", "network", "vendor", "hostname", "os", "os_accuracy",
-            "open_ports", "services", "http_title", "ssh_hostkey", "banners",
-            "interface", "scanner", "trusted", "label", "first_seen", "last_seen",
-        ]
-        d = dict(zip(cols, row))
+        """
+        Convert a sqlite3.Row into a plain dict, then post-process the
+        JSON/CSV-encoded fields into their real Python types.
+
+        Uses dict(row) — name-based, via the sqlite3.Row row_factory set
+        in _connect() — rather than a hardcoded positional column list.
+        This is deliberate: it makes this method correct regardless of
+        how many ALTER TABLE migrations a given database file has
+        accumulated, and in what order. See _connect()'s comment for
+        the specific bug this fixes.
+        """
+        d = dict(row)
 
         raw = d.get("open_ports") or ""
         d["open_ports"] = (
@@ -576,16 +927,13 @@ if __name__ == "__main__":
         assert updated_none is False
         print("[PASS] mDNS update on unknown IP → False, no crash")
 
-        # --- vendor enrichment (new) ---
-        # This device already has vendor="Apple Inc." from the upsert above —
-        # should NOT be overwritten.
+        # --- vendor enrichment ---
         v_updated = store.update_vendor_if_missing("aa:bb:cc:dd:ee:01", "Some Other Vendor")
         assert v_updated is False
         d = store.get("aa:bb:cc:dd:ee:01")
         assert d["vendor"] == "Apple Inc."
         print(f"[PASS] vendor enrichment did not overwrite existing vendor: {d['vendor']}")
 
-        # New device with NO vendor set — should update.
         store.upsert({
             "mac": "bb:cc:dd:ee:ff:02", "ip": "192.168.1.30",
             "network": "192.168.1.0/24", "scanner": "scapy",
@@ -599,6 +947,95 @@ if __name__ == "__main__":
         v_updated_unknown = store.update_vendor_if_missing("ff:ff:ff:ff:ff:ff", "Nobody")
         assert v_updated_unknown is False
         print("[PASS] vendor enrichment on unknown MAC → False, no crash")
+
+        # --- Trust-link token tracking (this revision) ---
+        from datetime import datetime, timezone, timedelta
+        future_expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(timespec="seconds")
+
+        first_use = store.mark_token_used(
+            token_id="tok_abc123",
+            mac="aa:bb:cc:dd:ee:01",
+            purpose="trust",
+            expires_at=future_expiry,
+        )
+        assert first_use is True
+        print("[PASS] First token redemption succeeded")
+
+        replay = store.mark_token_used(
+            token_id="tok_abc123",
+            mac="aa:bb:cc:dd:ee:01",
+            purpose="trust",
+            expires_at=future_expiry,
+        )
+        assert replay is False
+        print("[PASS] Replayed token rejected (already used)")
+
+        assert store.is_token_used("tok_abc123") is True
+        assert store.is_token_used("tok_never_seen") is False
+        print("[PASS] is_token_used() reflects redemption state correctly")
+
+        # Expired token cleanup — insert one already-expired row directly
+        store.mark_token_used(
+            token_id="tok_expired",
+            mac="bb:cc:dd:ee:ff:02",
+            purpose="trust",
+            expires_at="2020-01-01T00:00:00+00:00",  # long past
+        )
+        deleted = store.cleanup_expired_tokens()
+        assert deleted == 1
+        assert store.is_token_used("tok_expired") is False
+        assert store.is_token_used("tok_abc123") is True  # still-valid-expiry row untouched
+        print(f"[PASS] cleanup_expired_tokens() removed {deleted} expired row, left valid ones intact")
+
+        # --- model enrichment (IP-keyed, mirrors update_hostname_from_mdns) ---
+        store.upsert({
+            "mac": "cc:dd:ee:ff:00:11", "ip": "192.168.1.40",
+            "network": "192.168.1.0/24", "scanner": "scapy",
+        })
+        model_updated = store.update_model_from_ip("192.168.1.40", "iPhone14,5")
+        assert model_updated is True
+        d3 = store.get("cc:dd:ee:ff:00:11")
+        assert d3["model"] == "iPhone14,5"
+        print(f"[PASS] update_model_from_ip() filled empty model: {d3['model']}")
+
+        model_not_overwritten = store.update_model_from_ip("192.168.1.40", "SomethingElse")
+        assert model_not_overwritten is False
+        assert store.get("cc:dd:ee:ff:00:11")["model"] == "iPhone14,5"
+        print("[PASS] update_model_from_ip() did not overwrite existing model")
+
+        # --- vendor enrichment from IP (SSDP manufacturer) ---
+        store.upsert({
+            "mac": "dd:ee:ff:00:11:22", "ip": "192.168.1.41",
+            "network": "192.168.1.0/24", "scanner": "scapy",
+        })
+        vendor_ip_updated = store.update_vendor_from_ip("192.168.1.41", "Samsung")
+        assert vendor_ip_updated is True
+        assert store.get("dd:ee:ff:00:11:22")["vendor"] == "Samsung"
+        print("[PASS] update_vendor_from_ip() filled empty vendor")
+
+        # --- hostname by MAC (DHCP) ---
+        store.upsert({
+            "mac": "ee:ff:00:11:22:33", "ip": "192.168.1.42",
+            "network": "192.168.1.0/24", "scanner": "scapy",
+        })
+        dhcp_updated = store.update_hostname_by_mac("ee:ff:00:11:22:33", "DESKTOP-XYZ")
+        assert dhcp_updated is True
+        assert store.get("ee:ff:00:11:22:33")["hostname"] == "DESKTOP-XYZ"
+        print("[PASS] update_hostname_by_mac() filled empty hostname")
+
+        dhcp_not_overwritten = store.update_hostname_by_mac("ee:ff:00:11:22:33", "OtherName")
+        assert dhcp_not_overwritten is False
+        print("[PASS] update_hostname_by_mac() did not overwrite existing hostname")
+
+        dhcp_unknown_mac = store.update_hostname_by_mac("ff:ff:ff:ff:ff:ff", "Ghost")
+        assert dhcp_unknown_mac is False
+        print("[PASS] update_hostname_by_mac() on unknown MAC → False, no crash")
+
+        # --- delete_device ---
+        ok = store.delete("bb:cc:dd:ee:ff:02")
+        assert ok is True
+        assert store.get("bb:cc:dd:ee:ff:02") is None
+        print("[PASS] delete_device() → device removed")
 
         store.close()
         print("\nAll assertions passed.")

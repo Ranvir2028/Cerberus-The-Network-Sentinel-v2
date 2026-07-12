@@ -18,11 +18,16 @@ Rules:
     runs in a different OS process). get_scan_status() will report
     {"attached": False} — this is expected, not a bug.
   - learning_mode IS constructed here, pointed at the SAME state file
-    cerberus_main.py uses. Because learning_mode.py re-syncs from that
-    file's mtime on every check (see its module docstring), the
-    `learning stop` command issued from THIS process will actually
-    take effect in the live scanner's process within one scan cycle —
-    this is real cross-process control, not a CLI-local-only no-op.
+    cerberus_main.py uses (this revision: sourced from config's
+    learning_mode_state_file field, rather than a hardcoded literal
+    duplicated in both files — previously "data/learning_mode.json"
+    was written out separately in cerberus_main.py and here, two
+    places that had to be kept manually in sync with nothing enforcing
+    it). Because learning_mode.py re-syncs from that file's mtime on
+    every check (see its module docstring), the `learning stop`
+    command issued from THIS process will actually take effect in the
+    live scanner's process within one scan cycle — this is real
+    cross-process control, not a CLI-local-only no-op.
   - alert_manager IS constructed here too (for clear_cooldown on
     trust/untrust), but it is a SEPARATE in-memory instance from the
     one running inside cerberus_main.py — cooldown state is NOT
@@ -30,6 +35,23 @@ Rules:
     which IS file-synced). Functionally harmless: trust_engine's
     verdict is what actually matters for whether future alerts fire,
     and that IS shared via the DB.
+
+Seam fix (this revision):
+  main()'s cleanup previously called service._store.close() directly —
+  reaching past the seam into CerberusService's private storage
+  attribute from OUTSIDE that class, which is exactly the kind of
+  boundary violation this file's own docstring says it exists to
+  prove ISN'T happening. Fixed: cerberus_service.py now exposes a
+  proper close() method; this file calls service.close() instead.
+
+Friendlier error handling (this revision):
+  main() now wraps the actual command dispatch in a top-level
+  try/except so a service-layer failure (e.g. a transient DB error)
+  shows a short, clear message instead of a raw Python traceback —
+  relevant now that this project is headed toward public release,
+  where the person hitting an error may not be comfortable reading a
+  stack trace. --debug still shows the full traceback for anyone who
+  needs it (development, bug reports).
 
 Usage:
     python -m cerberus.cli.terminal list
@@ -49,6 +71,7 @@ Usage:
 import argparse
 import sys
 import os
+import traceback
 from typing import Dict, List
 
 sys.path.insert(
@@ -76,9 +99,10 @@ _vendor_lookup = VendorLookup()
 def _build_service(args: argparse.Namespace) -> CerberusService:
     """
     Construct a CerberusService for this CLI invocation. Reads the same
-    config (and therefore the same db_path / learning_mode state_file)
-    as cerberus_main.py, so it points at the exact same files — just
-    from a separate process.
+    config (and therefore the same db_path / learning_mode state_file /
+    link_secret) as cerberus_main.py, so it points at the exact same
+    files and shares the exact same Trust-link signing key — just from
+    a separate process.
     """
     try:
         cfg = get_config(config_file=args.config)
@@ -96,7 +120,7 @@ def _build_service(args: argparse.Namespace) -> CerberusService:
     learning_mode = LearningMode(
         device_store=store,
         duration_hours=cfg.learning_mode_hours,
-        state_file="data/learning_mode.json",
+        state_file=cfg.learning_mode_state_file,
     )
 
     return CerberusService(
@@ -105,6 +129,7 @@ def _build_service(args: argparse.Namespace) -> CerberusService:
         alert_manager=alert_manager,
         scheduler=None,   # no scheduler in this process — see docstring
         learning_mode=learning_mode,
+        link_secret=cfg.link_secret,
     )
 
 
@@ -154,6 +179,7 @@ def _print_device_detail(d: Dict) -> None:
     print(f"  Network     : {d.get('network','')}")
     print(f"  Vendor      : {vendor}")
     print(f"  Hostname    : {d.get('hostname') or 'unknown'}")
+    print(f"  Model       : {d.get('model') or 'unknown'}")
     print(f"  OS          : {d.get('os') or 'unknown'}"
           + (f" ({d['os_accuracy']}%)" if d.get('os_accuracy') else ""))
     print(f"  Label       : {d.get('label') or '(none)'}")
@@ -372,6 +398,8 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Cerberus v2 — terminal interface. Talks ONLY to service/cerberus_service.py.",
     )
     parser.add_argument("--config", default=None, help="Path to config.json")
+    parser.add_argument("--debug", action="store_true",
+                        help="Show full tracebacks on error instead of a short message")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_list = sub.add_parser("list", help="List devices")
@@ -430,13 +458,25 @@ def main() -> None:
 
     service = _build_service(args)
     try:
-        args.func(service, args)
+        try:
+            args.func(service, args)
+        except Exception as e:
+            if args.debug:
+                raise
+            print(
+                f"\n[ERROR] {e}\n"
+                "Re-run with --debug for the full traceback if you need to "
+                "report this.\n"
+            )
+            sys.exit(1)
     finally:
-        # Service doesn't expose close() directly (it's not its job to —
-        # it's a thin seam, not a lifecycle owner) but the underlying
-        # store does, and the CLI process is short-lived per invocation,
-        # so closing it here is the correct place.
-        service._store.close()
+        # Seam fix (this revision): previously called service._store.close()
+        # directly, reaching past the seam into CerberusService's private
+        # storage attribute. cerberus_service.py now exposes a proper
+        # close() method — this is the only call site that should ever
+        # need to close anything, and it goes through the seam like
+        # every other operation in this file.
+        service.close()
 
 
 if __name__ == "__main__":
