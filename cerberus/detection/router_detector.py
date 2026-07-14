@@ -11,16 +11,47 @@ Rules:
 - Zero active interfaces (airplane mode) → returns [], never crashes.
 - Every downstream caller must treat [] as a normal, handleable state.
 
-Update (Phase 3 hardening): added interface-NAME-based virtual adapter
-filtering alongside the existing IP-prefix filtering. Docker Desktop's
-WSL2/Hyper-V virtual switch ("vEthernet (WSL)", "vEthernet (Default
-Switch)") doesn't reliably fall into any fixed IP range, so it could slip
-past the IP-prefix check and get scanned as if it were a real LAN
-segment — which is what produced a spurious "docker.internal" entry
-that looked like an unknown device. Filtering by interface name closes
-that gap regardless of whatever IP range Docker/WSL happens to assign.
+Update (this revision) — WSL2 virtual-adapter filtering fixed properly:
+  A real bug was found in production: installing Docker Desktop (which
+  requires WSL2 as its backend) creates a new virtual network adapter
+  that the PREVIOUS version of this file's filtering failed to catch,
+  for two compounding reasons:
+
+    1. The interface-NAME filter (_is_virtual_interface_name, checking
+       for markers like "wsl"/"vethernet") assumed netifaces would
+       report a human-readable adapter name. On at least some Windows
+       configurations, netifaces-plus instead reports interfaces by
+       their raw GUID (e.g. "{51226080-FBDF-4025-926E-...}"), which
+       obviously never contains any of those marker substrings — the
+       name-based filter silently never had a chance to match.
+
+    2. The IP-RANGE filter (_is_virtual_adapter) only covered a few
+       FIXED /24-ish ranges specific to VMware/VirtualBox/Docker
+       Toolbox. WSL2's own default NAT network is NOT a fixed /24 —
+       it's assigned somewhere within the much larger 172.16.0.0/12
+       block (172.16.0.0–172.31.255.255), and the exact subnet can
+       vary per machine/reinstall. The old filter never accounted for
+       this entire range, so a WSL2 adapter landing anywhere in it
+       (e.g. the 172.21.176.0/20 seen in production) sailed straight
+       through undetected.
+
+  Fixed by replacing ad-hoc string-prefix matching with real CIDR
+  containment checks via the stdlib `ipaddress` module, and adding
+  172.16.0.0/12 to the known-virtual-ranges list. This is a genuinely
+  more correct approach than string prefixes in general (handles any
+  prefix length precisely, not just neat /24 boundaries written out by
+  hand), not just a one-off patch for this one range.
+
+  Practical impact of the bug before this fix: every detected "phantom"
+  virtual network gets its OWN full set of scan workers (Scapy + two
+  Nmap tiers, including a 4-thread aggressive pool) — on an 8-core
+  machine, one real network's workers competing with one phantom
+  network's workers for the same CPU cores measurably slows down
+  scanning of the network that actually matters, even though the
+  phantom network finds zero real devices every cycle.
 """
 
+import ipaddress
 import socket
 import struct
 import logging
@@ -77,31 +108,50 @@ def _is_loopback(interface: str, ip: str) -> bool:
     return False
 
 
+# Known virtual-adapter ranges, expressed as real CIDR networks rather
+# than string prefixes — this is what actually lets a range like
+# 172.16.0.0/12 (WSL2's full possible NAT space, not one fixed /24) be
+# checked correctly regardless of which specific subnet within it a
+# given machine happens to be assigned.
+_VIRTUAL_NETWORKS = [
+    ipaddress.ip_network("192.168.56.0/24"),   # VirtualBox host-only default
+    ipaddress.ip_network("192.168.153.0/24"),  # VMware host-only (common default)
+    ipaddress.ip_network("192.168.99.0/24"),   # Docker Toolbox (legacy)
+    ipaddress.ip_network("169.254.0.0/16"),    # APIPA / link-local — not a real network
+    ipaddress.ip_network("172.16.0.0/12"),     # WSL2 default NAT space (Docker
+                                                 # Desktop's WSL2 backend, and any
+                                                 # standalone WSL2 install) — this
+                                                 # is the range that was previously
+                                                 # missing entirely.
+]
+
+
 def _is_virtual_adapter(ip: str) -> bool:
     """
-    Return True if this IP belongs to a known virtual adapter range.
-    VMware uses 192.168.153.x and 192.168.x.1 on host-only adapters.
-    VirtualBox uses 192.168.56.x by default.
-    These produce zero real LAN devices — skip them.
+    Return True if this IP falls within a known virtual-adapter range.
+    Uses real CIDR containment (ipaddress module) rather than string
+    prefix matching, so a wide range like WSL2's 172.16.0.0/12 is
+    checked precisely regardless of which specific /20 or /24 within
+    it a given machine's adapter actually landed on.
     """
-    virtual_prefixes = (
-        "192.168.56.",   # VirtualBox host-only
-        "192.168.153.",  # VMware host-only (common default)
-        "192.168.99.",   # Docker Toolbox
-        "169.254.",      # APIPA / link-local — not a real network
-    )
-    return any(ip.startswith(p) for p in virtual_prefixes)
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in _VIRTUAL_NETWORKS)
 
 
 def _is_virtual_interface_name(interface: str) -> bool:
     """
     Return True if the INTERFACE NAME itself identifies it as virtual,
-    regardless of its IP range. Docker Desktop's WSL2/Hyper-V virtual
-    switch doesn't reliably fall into any fixed IP range the way
-    VMware/VirtualBox host-only adapters do, so an IP-prefix check
-    alone misses it. This is what produced the "docker.internal"
-    entry that looked like an unknown LAN device — Cerberus was
-    scanning its own host's virtual switch, not a real device.
+    regardless of its IP range. This is a SECONDARY check — see this
+    module's docstring for why it's known to be unreliable on some
+    Windows configurations (netifaces-plus may report a raw GUID
+    instead of a friendly adapter name there, in which case this check
+    silently never matches and _is_virtual_adapter's IP-range check
+    above is what actually does the work). Kept because on platforms
+    where a friendly name IS reported, it catches virtual adapters
+    that might not fall into any of the known IP ranges at all.
     """
     name_lower = interface.lower()
     virtual_name_markers = (

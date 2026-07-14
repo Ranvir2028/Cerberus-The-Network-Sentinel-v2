@@ -100,7 +100,7 @@ _DEFAULT_CONFIG = {
     "scapy_interval":             60,
     "nmap_quick_interval":        180,
     "nmap_aggressive_interval":   360,
-    "aggressive_workers":         4,
+    "aggressive_workers":         8,
     "learning_mode_hours":        24,
     "alert_cooldown_minutes":     10,
     "email_alerts_enabled":       False,
