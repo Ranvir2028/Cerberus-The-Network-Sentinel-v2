@@ -1,4 +1,3 @@
-# deps: none beyond stdlib + project modules
 """
 alerts/alert_manager.py
 

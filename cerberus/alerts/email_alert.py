@@ -1,4 +1,3 @@
-# deps: none beyond stdlib (smtplib, email) + project config_loader
 """
 alerts/email_alert.py
 
