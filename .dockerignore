@@ -13,7 +13,7 @@ cerberus/utils/npcap_installer.py
 # Runtime state — these are bind-mounted at container start, not
 # baked into the image. Including them here would just bloat the
 # build context and risk shipping your actual device DB/logs inside
-# the image layers.
+# the image layers
 data/
 logs/
 config/config.json

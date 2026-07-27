@@ -1,57 +1,32 @@
-# deps: none beyond stdlib + project modules
 """
-cli/terminal.py
+Text rendering over CerberusService, nothing else — only imports
+cerberus_service.CerberusService, never device_store/trust_engine/
+alert_manager/scheduler directly, so this file also doubles as a check
+that the service seam is real rather than something only the API uses.
 
-Job: thin text rendering over service/cerberus_service.py — and NOTHING
-else. This module's real purpose is proof: if every command here works
-correctly using only the service seam, the seam is real, not theoretical.
+Runs as its own OS process, separate from cerberus_main.py's scan loop.
+That's safe because device_store opens SQLite with
+PRAGMA journal_mode=WAL, which supports one writer plus multiple
+readers/writers across processes without corruption. There's no
+scheduler reference here (it lives in the scanner's process), so
+get_scan_status() reports {"attached": False} from the CLI — expected,
+not a bug.
 
-Rules:
-  - NEVER imports device_store, trust_engine, alert_manager, or scheduler
-    directly. Only cerberus_service.CerberusService.
-  - Runs as its OWN process, separate from cerberus_main.py's scan loop.
-    This works safely because device_store.py opens SQLite with
-    PRAGMA journal_mode=WAL — which explicitly supports one writer
-    (the running scanner) and multiple readers/writers from other
-    processes (this CLI) concurrently, without corruption.
-  - No scheduler reference is available in this process (the scanner
-    runs in a different OS process). get_scan_status() will report
-    {"attached": False} — this is expected, not a bug.
-  - learning_mode IS constructed here, pointed at the SAME state file
-    cerberus_main.py uses (this revision: sourced from config's
-    learning_mode_state_file field, rather than a hardcoded literal
-    duplicated in both files — previously "data/learning_mode.json"
-    was written out separately in cerberus_main.py and here, two
-    places that had to be kept manually in sync with nothing enforcing
-    it). Because learning_mode.py re-syncs from that file's mtime on
-    every check (see its module docstring), the `learning stop`
-    command issued from THIS process will actually take effect in the
-    live scanner's process within one scan cycle — this is real
-    cross-process control, not a CLI-local-only no-op.
-  - alert_manager IS constructed here too (for clear_cooldown on
-    trust/untrust), but it is a SEPARATE in-memory instance from the
-    one running inside cerberus_main.py — cooldown state is NOT
-    shared across processes for alert_manager (unlike learning_mode,
-    which IS file-synced). Functionally harmless: trust_engine's
-    verdict is what actually matters for whether future alerts fire,
-    and that IS shared via the DB.
+learning_mode gets constructed here too, pointed at the same state
+file cerberus_main.py uses (read from config's
+learning_mode_state_file rather than a literal duplicated in both
+places). Because learning_mode re-syncs from that file's mtime on
+every check, a `learning stop` issued from the CLI actually reaches
+the live scanner process within one scan cycle — real cross-process
+control, not a local no-op. alert_manager is also constructed here
+for clear_cooldown on trust/untrust, but as a separate in-memory
+instance — cooldown state isn't shared across processes the way
+learning_mode is. Harmless in practice, since trust_engine's verdict
+(shared via the DB) is what actually decides whether future alerts fire.
 
-Seam fix (this revision):
-  main()'s cleanup previously called service._store.close() directly —
-  reaching past the seam into CerberusService's private storage
-  attribute from OUTSIDE that class, which is exactly the kind of
-  boundary violation this file's own docstring says it exists to
-  prove ISN'T happening. Fixed: cerberus_service.py now exposes a
-  proper close() method; this file calls service.close() instead.
-
-Friendlier error handling (this revision):
-  main() now wraps the actual command dispatch in a top-level
-  try/except so a service-layer failure (e.g. a transient DB error)
-  shows a short, clear message instead of a raw Python traceback —
-  relevant now that this project is headed toward public release,
-  where the person hitting an error may not be comfortable reading a
-  stack trace. --debug still shows the full traceback for anyone who
-  needs it (development, bug reports).
+main() wraps command dispatch in a top-level try/except so a
+service-layer failure shows a short message instead of a raw
+traceback — pass --debug for the full trace.
 
 Usage:
     python -m cerberus.cli.terminal list
@@ -470,12 +445,9 @@ def main() -> None:
             )
             sys.exit(1)
     finally:
-        # Seam fix (this revision): previously called service._store.close()
-        # directly, reaching past the seam into CerberusService's private
-        # storage attribute. cerberus_service.py now exposes a proper
-        # close() method — this is the only call site that should ever
-        # need to close anything, and it goes through the seam like
-        # every other operation in this file.
+        # Goes through the seam like everything else — cerberus_service.py
+        # exposes a proper close() method rather than this file reaching
+        # into CerberusService's private storage attribute directly.
         service.close()
 
 

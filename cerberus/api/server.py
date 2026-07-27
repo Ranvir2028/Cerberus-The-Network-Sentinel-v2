@@ -1,66 +1,38 @@
-# deps: pip install Flask flask-cors
 """
-api/server.py
+Flask app exposing CerberusService as JSON over HTTP. Every route is
+close to a one-line dispatch into service/ — this file's only real job
+is the HTTP/JSON translation. Runs embedded inside cerberus_main.py's
+own process (a background thread), not as a separate invocation, so
+every endpoint has live access to the actual running scheduler/
+alert_manager/learning_mode rather than a stale copy.
 
-Job: Flask app exposing service/cerberus_service.py as JSON HTTP
-endpoints. Thin by design — every route handler is close to a one-line
-call into service/, with HTTP/JSON translation being the only real work
-this file does.
+Auth: if CERBERUS_API_SECRET is set, /api/* requests need an
+X-API-Key header. /api/health skips auth (basic liveness check), and so
+does /confirm/trust/<token> — but for a different reason: the signed
+token itself is the credential there, since that link gets opened from
+an email client, not the dashboard.
 
-Design decision — embedded, not standalone:
-  Runs INSIDE cerberus_main.py's own process (background thread), not
-  as a separate invocation. This gives every endpoint genuinely live
-  access to the actual running scheduler/alert_manager/learning_mode —
-  see CerberusService construction in cerberus_main.py.
+CORS is scoped to /api/*, any origin for now — this is meant as a
+single-operator LAN tool, so if it's ever exposed beyond a trusted
+network, tighten that to a specific origin.
 
-Auth:
-  If CERBERUS_API_SECRET is set, every /api/* request must include
-  header: X-API-Key: <the secret>. /api/health is intentionally
-  unauthenticated (basic liveness check). /confirm/trust/<token> is
-  ALSO intentionally unauthenticated (see below) — the token itself is
-  the credential, not the X-API-Key header, since these links are
-  opened from an email client, not the dashboard.
+Email trust confirmation is split into two routes on purpose:
+GET /confirm/trust/<token> only renders a confirmation page and calls
+verify_trust_token(), which has no side effects — it never marks a
+token used. That matters because some email providers and corporate
+gateways pre-fetch links before a human opens them, and a GET that
+actually trusted the device would get silently triggered by that
+prefetch. Only POST /confirm/trust/<token> calls
+redeem_trust_token(), and that's protected against double-submission
+by a UNIQUE constraint on token_id in device_store. Neither route
+requires X-API-Key — the token itself works like a password-reset
+link from any other service, and rejecting bad/expired/reused tokens
+is cerberus_service's job, not this file's.
 
-CORS (added this revision):
-  Module 16's React frontend will run on its own dev server (different
-  port — e.g. Vite on :5173) and call this API from the browser.
-  Browsers block cross-origin requests by default, so without CORS
-  headers, every fetch() call from the frontend would fail silently
-  with a CORS error before the frontend is even built — better to add
-  this now than debug it blind later. Scoped to /api/* only, allows
-  any origin for now since this is a single-operator LAN tool; tighten
-  to a specific origin if this is ever exposed beyond a trusted network.
-
-Email Trust confirmation (this revision):
-  GET  /confirm/trust/<token>  — renders a styled HTML confirmation
-    page. NO side effects — calls service.verify_trust_token() only,
-    which never marks a token used or trusts a device. This
-    distinction matters specifically because some email providers and
-    corporate security gateways pre-fetch/scan links in emails before
-    a human ever opens them; if GET performed the trust action, that
-    prefetching would silently trust devices without the operator
-    ever clicking anything. The page requires an actual button click
-    (a real POST, triggered by the browser submitting a form) before
-    anything changes.
-  POST /confirm/trust/<token>  — the only route that actually calls
-    service.redeem_trust_token(), which is atomic against double-
-    submission (device_store.mark_token_used()'s UNIQUE constraint on
-    token_id guarantees only one concurrent request can ever succeed).
-  Both routes are unauthenticated by design (no X-API-Key required) —
-  the signed token IS the authentication, exactly like a password-
-  reset email link from any other service. Rejecting bad/expired/
-  reused tokens is verify_trust_token()/redeem_trust_token()'s job in
-  cerberus_service.py, not this file's.
-
-Rules:
-  - Every route is a thin dispatch into a CerberusService instance
-    passed in at construction time. No business logic here.
-  - Never imports storage/intelligence/alerts directly — only the seam.
-  - All JSON API responses use {"error": "..."} with an appropriate
-    HTTP status code, never a raw stack trace to the client. The two
-    /confirm/trust/<token> routes return styled HTML pages instead of
-    JSON, since they're meant to be opened directly in a browser from
-    an email link, not consumed by the dashboard's fetch() calls.
+JSON error responses are always {"error": "..."} with a real status
+code, never a raw stack trace. The two /confirm/trust routes are the
+exception — they return styled HTML, since they're opened directly in
+a browser from an email link rather than called via fetch().
 """
 
 import logging
@@ -328,7 +300,7 @@ def create_app(service: CerberusService, api_secret: Optional[str] = None) -> Fl
         return jsonify(service.get_scan_status())
 
     # ------------------------------------------------------------------
-    # Settings (this revision)
+    # Settings
     # ------------------------------------------------------------------
 
     @app.route("/api/settings", methods=["GET"])
@@ -367,7 +339,7 @@ def create_app(service: CerberusService, api_secret: Optional[str] = None) -> Fl
         return jsonify({"status": "ok"})
 
     # ------------------------------------------------------------------
-    # Email Trust confirmation (this revision) — NOT under /api/*,
+    # Email Trust confirmation — NOT under /api/*,
     # deliberately outside the X-API-Key requirement, meant to be
     # opened directly in a browser from an alert email's link.
     # ------------------------------------------------------------------
@@ -394,7 +366,7 @@ def create_app(service: CerberusService, api_secret: Optional[str] = None) -> Fl
         return html
 
     # ------------------------------------------------------------------
-    # Device self-identification (this revision) — also outside
+    # Device self-identification — also outside
     # /api/*, unauthenticated by design: the signed token bound to one
     # specific device IS the credential, same reasoning as the Trust
     # confirmation routes above. The operator triggers issuance from
@@ -776,7 +748,7 @@ if __name__ == "__main__":
         store2.close()
         print("All auth assertions passed.")
 
-        # --- Trust confirmation flow (this revision) ---
+        # --- Trust confirmation flow ---
         from cerberus.utils.link_tokens import generate_token
 
         store3 = DeviceStore(_os.path.join(tempfile.mkdtemp(), "test3.db"))

@@ -1,9 +1,9 @@
 """
 cerberus_main.py — Phase 1+2+3 headless engine, plus email Trust/Block
-links and the expanded passive/active discovery stack (this revision).
+links and the expanded passive/active discovery stack.
 
 Config priority: env vars > config/config.json > built-in defaults.
-CLI args override config file for quick one-off runs.
+CLI args override the config file for quick one-off runs.
 
 Scan tiers:
   Scapy ARP        every scapy_interval        (default 60s)
@@ -14,37 +14,32 @@ Scan tiers:
   SSDP discovery   every ssdp_interval          (default 180s, global)
   LLMNR discovery  every llmnr_interval         (default 90s, global)
 
-Npcap check (this revision):
-  On Windows, checks for Npcap (required for Scapy's raw ARP scanning)
-  and silently installs it if missing — fully non-interactive, no
-  prompts. See utils/npcap_installer.py's module docstring for why this
-  now also matters for Linux/macOS correctness (a prior bug there would
-  have crashed the import chain on non-Windows entirely). If Npcap is
-  required and could not be made available (e.g. missing admin rights,
-  download failure), Cerberus exits rather than starting with a scanner
-  that can't actually capture packets — a silent partial-functionality
-  start would be more confusing than a clear failure at boot.
+On Windows, checks for Npcap (needed for Scapy's raw ARP scanning) and
+silently installs it if missing — fully non-interactive. See
+npcap_installer.py's docstring for why this matters for Linux/macOS
+correctness too. If Npcap is required and can't be made available
+(no admin rights, download failure), Cerberus exits rather than
+starting a scanner that can't actually capture packets — a clear
+failure at boot beats a silent partial start.
 
-Email Trust/Block links (this revision):
-  CerberusService is now constructed with link_secret=cfg.link_secret,
-  enabling the /confirm/trust/<token> routes in api/server.py. Without
-  this, those routes still exist but every request returns "Trust
-  links are not enabled" (service.verify_trust_token() checks for a
-  missing link_secret explicitly — see cerberus_service.py).
+CerberusService gets constructed with link_secret=cfg.link_secret,
+which is what enables the /confirm/trust/<token> routes in
+server.py — without it those routes still exist but every request
+returns "Trust links are not enabled" (verify_trust_token() checks for
+a missing link_secret explicitly).
 
-Learning-mode auto-start (bugfix, carried from a previous revision):
-  Previously, learning_mode.start() was called UNCONDITIONALLY on every
-  launch — meaning if you deliberately stopped learning mode via the
-  CLI (`learning stop`) and then restarted the scanner, it would
-  silently re-open a brand new 24h auto-trust window, undoing your
-  decision with no warning. Fixed: this now checks
-  learning_mode.has_ever_started() first. A genuine first-ever run
-  (no state file, or a state file that's never recorded a start) still
-  auto-starts exactly as before. Any run after that — including after
-  a deliberate stop — does NOT auto-start; the operator must explicitly
-  run `learning start` (CLI) or POST /api/learning/start (API), or pass
-  --force-relearn, e.g. when they've deliberately changed network
-  location and want a fresh trust-everything baseline.
+Learning-mode auto-start had a real bug: learning_mode.start() used to
+get called unconditionally on every launch, so deliberately stopping
+learning mode via `learning stop` and then restarting the scanner
+would silently reopen a fresh 24h auto-trust window, undoing that
+decision with no warning. Fixed by checking
+learning_mode.has_ever_started() first — a genuine first-ever run
+(no state file, or one that's never recorded a start) still
+auto-starts as before, but any run after that, including after a
+deliberate stop, doesn't. The operator has to explicitly run
+`learning start` (CLI), POST /api/learning/start (API), or pass
+--force-relearn — e.g. after moving to a new network and wanting a
+fresh trust-everything baseline.
 """
 
 import argparse

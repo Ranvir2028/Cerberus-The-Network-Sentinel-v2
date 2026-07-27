@@ -25,7 +25,7 @@ version: "3.8"
 # needs CERBERUS_PUBLIC_URL (your host machine's actual LAN IP) rather
 # than a service name like "http://cerberus-core:5000" — the same
 # constraint already documented in .env.example for the email Trust
-# links, now applying here too.
+# links, now applying here too
 
 services:
   cerberus-core:

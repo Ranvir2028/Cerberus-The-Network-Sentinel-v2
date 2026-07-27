@@ -1,3 +1,4 @@
+# dependencies for the project
 netifaces-plus
 scapy
 python-nmap

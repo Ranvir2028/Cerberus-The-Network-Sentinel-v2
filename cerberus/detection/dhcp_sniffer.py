@@ -1,65 +1,31 @@
-# deps: pip install scapy (already a project dependency, see scanner_scapy.py)
 """
-detection/dhcp_sniffer.py
+Passively watches DHCP broadcast traffic for the hostname a device
+announces during its own negotiation (DHCP Option 12, "Host Name").
+Useful because it's close to universal — almost every device does a
+DHCP negotiation at least once on connect — and unlike mDNS it hands
+back the MAC directly instead of just an IP the scheduler has to
+correlate separately. Covers devices that skip both mDNS (many Windows
+boxes, plenty of IoT) and NetBIOS (iOS never responds to it at all).
 
-Job: passively observe DHCP broadcast traffic and extract the hostname
-a device announces during its own DHCP negotiation — a signal source
-that is completely independent of mDNS, and notably gives us the
-device's MAC address DIRECTLY (unlike mDNS, which only ever reveals an
-IP and requires the scheduler to correlate IP→MAC separately).
+Architecturally this can't work the same way as mdns/ssdp/llmnr
+discovery. Those are all "ask a question, wait N seconds for answers,"
+which the scheduler can rerun fresh every cycle. DHCP has no such
+query — a device only volunteers its hostname during its own
+negotiation, on connect or at renewal (which can be hours apart), so a
+short listen window would miss almost everything. Instead: start()
+spawns one continuous background sniffer thread for the life of the
+process, accumulating hostnames into a thread-safe buffer, and
+drain_new_sightings() is what the scheduler calls periodically to pull
+whatever's accumulated and clear the buffer — nothing lost between
+drains, nothing double-reported.
 
-Why this exists:
-  Almost every device does a DHCP negotiation at some point (initial
-  connect, at minimum) and includes its own hostname in the request via
-  DHCP Option 12 ("Host Name") — this is close to universal coverage,
-  broader than mDNS (which iOS/macOS/some Linux support well, but many
-  Windows machines and IoT devices don't bother with) or NetBIOS
-  (which iOS never responds to at all, per trust_engine.py's existing
-  MAC-randomization notes). This closes a real gap: devices that
-  respond to neither mDNS nor NetBIOS/SMB can still be identified by
-  hostname via DHCP, since virtually nothing skips DHCP entirely.
-
-Architectural difference from mdns_discovery.py / ssdp / llmnr (read
-this before assuming the same pattern applies):
-  mDNS, SSDP, and LLMNR are all "ask a question, wait for answers
-  within N seconds" — an active browse cycle the scheduler can run
-  fresh every cycle. DHCP has NO such query mechanism available to an
-  observer — Cerberus cannot ask "does anyone want to tell me their
-  hostname" over DHCP; it can only wait for a device to volunteer one
-  during its OWN negotiation, which happens on connect and at renewal
-  time (often hours apart, sometimes longer). A short one-shot
-  "listen for 5 seconds" window would miss almost everything.
-
-  So this module is NOT called repeatedly with a timeout the way
-  MDNSDiscovery.discover() is. Instead:
-    - start() spawns ONE continuous background sniffer thread that
-      runs for the lifetime of the process (until stop() is called),
-      accumulating every DHCP hostname it observes into an internal,
-      thread-safe buffer.
-    - drain_new_sightings() is what the scheduler calls periodically
-      (e.g. every 60s, alongside its other per-cycle work) to pull
-      whatever has accumulated since the last drain and clear the
-      buffer. Nothing is lost between drains; nothing is double
-      reported after a drain.
-
-Rules (same isolation pattern as scanner_scapy.py / mdns_discovery.py):
-  - No storage, no trust logic — returns raw sighting dicts only.
-  - Never SENDS a packet — this is passive capture only (scapy.sniff,
-    never scapy.send/srp). This is a deliberate, narrower use of scapy
-    than scanner_scapy.py's active ARP probing; using the same library
-    for a fundamentally different (passive-only) purpose does not
-    violate the "scanners never import detection" isolation rule —
-    that rule is about active scanning/topology coupling, not a
-    blanket ban on which network libraries a detection module may use
-    to passively listen to traffic that's already occurring.
-  - Requires the same raw-capture privilege as scanner_scapy.py
-    (Administrator on Windows with Npcap, root/CAP_NET_RAW on Linux/
-    macOS) — if that's unavailable, start() logs an error and the
-    sniffer simply never produces sightings; it does not crash the
-    scheduler that owns it.
-  - Never crashes on a malformed/unexpected packet — every packet is
-    parsed defensively; one broken packet must never kill the
-    background thread for the rest of the process's lifetime.
+Passive only — scapy.sniff, never scapy.send/srp, unlike
+scanner_scapy.py's active ARP probing. Needs the same raw-capture
+privilege as that module (Administrator+Npcap on Windows, root/
+CAP_NET_RAW on Linux/macOS); without it, start() just logs an error
+and never produces sightings rather than crashing the scheduler that
+owns it. Every packet is parsed defensively so a malformed one can't
+kill the background thread.
 
 Usage:
     sniffer = DHCPSniffer()

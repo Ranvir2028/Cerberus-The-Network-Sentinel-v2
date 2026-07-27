@@ -1,24 +1,10 @@
-# deps: pip install scapy
 """
-core/scanner_scapy.py
-
-Job: given one network CIDR string, send one ARP broadcast
-(optionally preceded by a wake-up ICMP ping) and return every
-device that answered as a list of {ip, mac, network} dicts.
-
-Rules:
-- Pure function contract: network string IN → device list OUT.
-- Does NOT import RouterDetector. Does NOT detect networks itself.
-- Does NOT store anything. Does NOT decide trust.
-- Scheduler injects the network string — this module never fetches it.
-- Empty network / no responses → return [], never crash.
-
-Bugs fixed from old version:
-  1. `network: network` dict-key bug  → fixed to `'network': network`
-  2. Broken retry loop (return [] inside for-loop body) → fixed
-  3. `update_network` dead line `self.auto_detect = new_network` → removed
-  4. `scan_all_networks` that called RouterDetector internally → removed entirely
-     (scheduler's job now, not the scanner's)
+Given a network CIDR string, sends one ARP broadcast (optionally
+preceded by a wake-up ICMP ping) and returns every device that
+answered as a list of {ip, mac, network} dicts. Pure function
+contract — no RouterDetector, no storage, no trust logic, no fetching
+the network string itself (scheduler injects it). Empty network or no
+responses just returns [], never raises.
 """
 
 import time

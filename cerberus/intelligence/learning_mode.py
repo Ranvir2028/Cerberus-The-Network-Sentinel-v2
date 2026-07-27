@@ -1,48 +1,29 @@
-# deps: none — stdlib only
 """
-intelligence/learning_mode.py
+Manages a time-boxed window where every discovered device gets
+auto-trusted instead of flagged as unknown. On first run Cerberus has
+zero trusted devices — without this, every device on the network
+(router, phone, laptop, TV) would trigger an "INTRUDER" alert
+immediately, which is useless. Learning mode gives it a window
+(default 24h) to silently observe and auto-trust everything, then
+hands off to trust_engine's normal judgment once the window closes.
 
-Job: manage a time-boxed window during which every discovered device gets
-auto-marked trusted instead of flagged as unknown.
+Owns exactly one piece of state — is learning mode active, when did it
+start, when does it end — and nothing else; no trust logic
+duplication, no scanning. trust_engine and the scheduler just consult
+is_active(). Persisted to a small JSON file (default
+data/learning_mode.json) so a restart mid-window picks up where it
+left off instead of resetting the clock.
 
-Why this exists:
-  On first run, Cerberus has zero trusted devices. Without learning mode,
-  every single device on the network — your router, your phone, your laptop,
-  your TV — would immediately trigger an "INTRUDER" alert. That's useless.
-  Learning mode gives Cerberus a window (default 24 hours) to silently
-  observe and auto-trust everything it sees. After the window closes,
-  trust_engine takes over normal judgment — anything new after that is
-  genuinely unknown and worth alerting on.
-
-This module owns exactly one piece of state:
-  - Is learning mode currently active?
-  - When did it start?
-  - When does it end?
-
-It does NOT duplicate trust logic. It does NOT scan anything.
-It exposes a simple check that trust_engine and the scheduler consult.
-
-Persistence:
-  Learning mode state is saved to a small JSON file (default:
-  data/learning_mode.json) so it survives restarts. If Cerberus is
-  restarted within the learning window, it picks up where it left off
-  rather than resetting the clock.
-
-Cross-process sync (added Phase 3 hardening):
-  The running scanner (cerberus_main.py) and the CLI (cli/terminal.py)
-  are SEPARATE OS processes, each with their OWN in-memory LearningMode
-  object. Originally, state was only ever loaded from the file once, at
-  __init__ time — meaning if the CLI called stop() to end learning mode
-  early, the scanner's own running process would never notice, because
-  it never looked at the file again.
-
-  Fix: is_active() and status() now check the state file's modification
-  time before answering. If the file has changed since this instance
-  last read it (e.g. because the CLI process just wrote a "stopped"
-  state), this instance reloads from disk before answering. This makes
-  the JSON file the genuine source of truth shared across processes,
-  not just a restart-recovery snapshot — at the cost of one stat() call
-  per check, which is negligible.
+The scanner (cerberus_main.py) and the CLI (terminal.py) run as
+separate processes, each with its own in-memory LearningMode object.
+Originally state was only loaded once at __init__, so if the CLI
+called stop() to end learning mode early, the running scanner process
+never noticed since it never re-read the file. Fixed by having
+is_active() and status() check the state file's mtime before
+answering — if it's changed since this instance last read it, reload
+from disk first. Makes the JSON file the real shared source of truth
+instead of just a restart-recovery snapshot, at the cost of one
+stat() call per check.
 
 Usage:
     lm = LearningMode(store=device_store)

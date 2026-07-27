@@ -1,53 +1,32 @@
-# deps: pip install zeroconf
 """
-detection/mdns_discovery.py
+Passive mDNS (Bonjour/Zeroconf) discovery — finds device hostnames
+broadcast over multicast DNS, independent of MAC address. Matters
+because MAC randomization (iOS "Private Wi-Fi Address", Android's
+equivalent) means the same phone can show a different MAC on every
+reconnect, which breaks MAC-keyed trust tracking. mDNS identifies
+devices by the name they broadcast instead (e.g. "Harshs-iPhone.local"),
+which stays stable across MAC churn — a much better secondary signal
+for trust_engine's hostname correlation than NetBIOS alone, since iOS
+devices don't respond to NetBIOS/SMB at all and Nmap's nbstat never
+sees them, but they almost always answer mDNS.
 
-Job: passive mDNS (Bonjour/Zeroconf) discovery — finds device hostnames
-broadcast over multicast DNS, independent of MAC address.
+Also parses TXT records from service types it's already browsing —
+no extra traffic, no new service types. Apple's _device-info._tcp
+carries a "model" key with a real hardware string (e.g.
+"iPhone14,5"), more specific than anything VendorLookup's OUI
+database can give since OUI only identifies the manufacturer.
+_airplay/_raop carry model/deviceid for Apple TVs and AirPlay
+receivers; _googlecast carries "md"/"fn" for Chromecast and Android
+TV. All delivered in the same get_service_info() call this module
+already makes for the hostname — just not discarded anymore.
 
-Why this exists:
-  MAC randomization (iOS "Private Wi-Fi Address", Android's equivalent)
-  means the SAME physical phone can show up under a different MAC every
-  time it reconnects — confusing any MAC-keyed trust tracking. mDNS
-  identifies devices by the NAME they broadcast (e.g. a phone announcing
-  itself as "Harshs-iPhone.local"), which stays stable across MAC churn.
-  This gives trust_engine's existing hostname-correlation logic (see
-  intelligence/trust_engine.py) a much more reliable secondary signal
-  than NetBIOS alone — iOS devices in particular don't respond to
-  NetBIOS/SMB at all, so Nmap's nbstat script never sees them, but they
-  almost always respond to mDNS.
-
-TXT-record parsing (this revision):
-  Several of the service types this module already browses carry TXT
-  records — small key/value metadata attached to the same
-  announcement, no extra network traffic or new service types needed.
-  The most useful for Cerberus's purposes:
-    - Apple's _device-info._tcp.local. TXT record includes a "model"
-      key (e.g. "model=iPhone14,5", "model=MacBookPro18,1") — a real
-      hardware model string, not just "Apple". This is genuinely more
-      specific than what VendorLookup's OUI database can ever provide
-      (OUI only identifies the MANUFACTURER, never the specific
-      device model).
-    - _airplay._tcp.local. and _raop._tcp.local. often carry "model"
-      and/or "deviceid" keys for Apple TVs, HomePods, and AirPlay
-      receivers.
-    - _googlecast._tcp.local. carries "md" (model) and "fn" (friendly
-      name) keys for Chromecast/Google/Android TV devices.
-  Parsing these doesn't require any new service type or extra
-  listening time — the TXT record is already delivered as part of the
-  SAME get_service_info() call this module was already making for the
-  hostname. This revision just stops discarding that data.
-
-Rules (same isolation pattern as scanner_scapy.py / scanner_nmap.py):
-  - No Scapy/Nmap import. No storage. No trust logic.
-  - Pure: listen for `timeout` seconds, return whatever responded.
-  - Does NOT know which MAC owns a given IP — mDNS operates at the IP
-    layer, not the MAC layer. Correlating an IP's mDNS hostname/model
-    back to a specific device row is the SCHEDULER's job (it already
-    holds the device_store reference) — this module only reports
-    "this IP announced this name/model."
-  - zeroconf missing → logs a warning once, returns [] on every call,
-    never crashes the scheduler that depends on it.
+Pure: listen for `timeout` seconds, return whatever responded. Doesn't
+know which MAC owns a given IP — mDNS operates at the IP layer, so
+correlating a hostname/model back to a specific device row is the
+scheduler's job, since it already holds the device_store reference;
+this module only reports "this IP announced this name/model." If
+zeroconf isn't installed, logs a warning once and returns [] on every
+call rather than crashing the scheduler that depends on it.
 
 Usage:
     mdns = MDNSDiscovery(timeout=5)
@@ -164,7 +143,7 @@ class _CollectingListener(ServiceListener):
         pass  # Not needed for a one-shot discovery cycle
 
     # ------------------------------------------------------------------
-    # TXT record parsing (this revision)
+    # TXT record parsing
     # ------------------------------------------------------------------
 
     def _extract_model(self, info) -> Optional[str]:

@@ -1,71 +1,36 @@
 """
-alerts/alert_manager.py
+Sits between trust_engine's verdicts and the actual notification
+channels. Decides WHETHER to alert (per-MAC cooldown, so one intruder
+doesn't trigger fifty emails in an hour) and builds the message; email/
+webhook/etc modules only know HOW to send what they're handed. Never
+touches the DB directly — process_verdicts() just returns the verdicts
+that actually fired, and scheduler.py is what persists those to
+alerts_log. Config-driven (get_config()), thread-safe since scheduler
+calls in from worker threads.
 
-Job: receives trust verdicts from the scheduler/trust_engine pipeline
-and decides whether to fire a notification, applying a cooldown window
-per device so one intruder doesn't trigger 50 alerts over an hour.
+Vendor strings matching a known hypervisor (VMware/VirtualBox/etc) get
+an informational VM tag on the alert — doesn't change the verdict, just
+the wording.
 
-Rules:
-  - Cooldown per MAC: if a device was alerted within cooldown_minutes,
-    skip it. Clock resets when the device disappears and reappears.
-  - Channels (email, future: webhook, desktop) are owned by their own
-    modules. alert_manager decides WHETHER to alert — channels only
-    know HOW to send.
-  - No storage writes — alert_manager never touches the DB. (The one
-    exception in spirit, not in fact: Trust-link TOKEN GENERATION below
-    is pure signing via utils/link_tokens.py, itself DB-free. Recording
-    a token as REDEEMED is device_store.mark_token_used()'s job, called
-    from api/server.py — not here.)
-  - Reads config via get_config() — never hardcodes cooldown or toggles.
-  - Thread-safe: scheduler calls process_verdicts() from worker threads.
+Every alert becomes an AlertMessage with both a plain-text and HTML
+body carrying two action links:
 
-Persistence note (module 13):
-  process_verdicts() RETURNS the list of verdicts that were actually
-  fired — see scheduler.py for how that's persisted to alerts_log.
+  TRUST — a signed, single-use, time-limited token (link_tokens.py)
+  pointing at /confirm/trust/<token>. That route requires an explicit
+  click before calling trust_device(), specifically because some email
+  clients pre-fetch links before a human sees them — a bare GET that
+  triggered trust directly would get silently fired by that prefetch.
 
-VM/hypervisor tagging (Phase 3 hardening):
-  message composition annotates the alert if the device's vendor
-  matches a known virtualization platform — purely informational.
+  BLOCK — deliberately not automated. Just a link to the device's
+  network gateway (from RouterDetector) plus the router admin
+  credentials shown as plain text, so you log in and block it
+  yourself. No credentials get submitted on your behalf, no per-vendor
+  router automation. If the gateway or credentials aren't known, the
+  email says so instead of rendering a half-broken section.
 
-Email Trust/Block action links (this revision):
-  Every alert-worthy verdict now gets composed into an AlertMessage —
-  both a plain-text body (unchanged format from before) and a styled
-  HTML body with two action elements:
-
-    TRUST — a signed, single-use, time-limited link
-      (utils/link_tokens.generate_token) pointing at
-      <public_base_url>/confirm/trust/<token>. Clicking it lands on a
-      confirmation page (api/server.py) that requires an explicit
-      button click before calling service.trust_device() — this
-      indirection exists specifically because some email providers
-      pre-fetch/scan links before a human ever sees them, and a link
-      that performed the trust action on mere GET would be silently
-      triggered by that prefetching. See api/server.py's /confirm/
-      trust/<token> routes for the confirmation step itself.
-
-    BLOCK — per the operator's explicit decision, this is NOT an
-      automated action. It is a direct link to the device's network
-      gateway (http://<gateway>, from RouterDetector via
-      set_network_gateways()) plus the router admin username/password
-      displayed as plain text in the email, so the operator can log in
-      and block the device manually. No per-router-vendor automation,
-      no credentials submitted on the operator's behalf — Cerberus
-      only ever navigates them to their own router's existing login
-      page. If no gateway is known for the device's network, or no
-      router credentials are configured, the email explains what's
-      missing instead of showing a broken/incomplete section.
-
-  Both links are built fresh per alert (trust_link needs a new signed
-  token every time; block_link is just a lookup) inside
-  _compose_message() — channels receive the finished AlertMessage and
-  never build links themselves.
-
-Block-this-device hint (superseded by the above):
-  Earlier revisions embedded a text-only "block hint" pointing at the
-  gateway inside the plain-text message body. That's now folded into
-  AlertMessage.block_link + the dedicated Block section of both the
-  text and HTML bodies, rather than being inline prose — same content,
-  more structured.
+Both links get built fresh per alert inside _compose_message() — the
+trust token especially, since it has to be new every time. Channels
+never construct links themselves, only render what they're given.
 """
 
 import logging
@@ -90,7 +55,7 @@ def _now() -> datetime:
 class AlertMessage:
     """
     A composed alert, in both plain-text and HTML form, plus the
-    Trust/Block action links this revision adds.
+    Trust/Block action links.
 
     Channels use whichever representation suits them — email_alert.py
     sends both .text and .html as a multipart/alternative message; a
@@ -111,7 +76,7 @@ class AlertManager:
 
     Usage:
         manager = AlertManager()
-        manager.register_channel(email.send)        # Phase 3
+        manager.register_channel(email.send)
         manager.set_network_gateways({"192.168.1.0/24": "192.168.1.1"})
         fired = manager.process_verdicts(verdicts)    # called by scheduler
 

@@ -1,4 +1,4 @@
-# Ye vala module updated hai colorama ka use karke ab thoda sa fancy lagega zarurat nahi thi par still bana diya maje ke liye hehehe.
+# Ye vala module updated hai colorama ka use karke ab thoda sa fancy lagega zarurat nahi thi par still bana diya maje ke liye.
 """
 Logging setup Module to make and look the code clean.
 Usage:

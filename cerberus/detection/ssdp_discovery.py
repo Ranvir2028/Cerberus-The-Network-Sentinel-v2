@@ -1,45 +1,28 @@
-# deps: none — stdlib only (socket, urllib, xml.etree)
 """
-detection/ssdp_discovery.py
-
-Job: active SSDP/UPnP discovery — sends an M-SEARCH multicast query and
+Active SSDP/UPnP discovery — sends an M-SEARCH multicast query and
 collects responses from smart TVs, printers, game consoles, media
-servers, and other UPnP-capable devices on the network.
+servers, and anything else UPnP-capable. Many consumer devices
+implement UPnP even when they ignore mDNS and NetBIOS, so this is a
+third independent identity signal alongside mdns_discovery.py and
+dhcp_sniffer.py — a device silent on both of those may still show up
+here.
 
-Why this exists:
-  Many consumer devices (smart TVs, printers, Chromecasts, game
-  consoles, NAS boxes, some IoT hubs) implement UPnP/SSDP for local
-  network discovery even when they don't respond to mDNS or NetBIOS.
-  This is a THIRD independent identity signal alongside mDNS
-  (detection/mdns_discovery.py) and DHCP (detection/dhcp_sniffer.py) —
-  a device that stays silent on the other two may still announce
-  itself here.
+Two stages, which is what makes this more useful than a bare protocol
+probe. Stage 1 sends the M-SEARCH multicast to 239.255.255.250:1900
+and collects unicast replies for `timeout` seconds; each reply's
+headers include a LOCATION URL pointing at an XML device-description
+document. Stage 2 fetches that document (short bounded timeout per
+fetch) for friendlyName / manufacturer / modelName / modelNumber —
+usually far more specific than an OUI vendor lookup, e.g. "Living Room
+TV" or "Canon MG3600 series" instead of just a vendor name. This is
+best-effort — a device whose description fetch fails still gets
+reported with whatever M-SEARCH itself returned.
 
-Two-stage discovery (this is what makes SSDP more useful than a bare
-protocol probe):
-  Stage 1 — M-SEARCH: send a multicast UDP query to 239.255.255.250:1900
-    and collect the direct unicast replies for `timeout` seconds. Each
-    reply's headers include a LOCATION URL pointing at an XML "device
-    description" document.
-  Stage 2 — description fetch: for each distinct LOCATION URL seen,
-    fetch that XML document (short bounded timeout per fetch) and
-    extract friendlyName / manufacturer / modelName / modelNumber —
-    fields that are usually FAR more specific and human-readable than
-    anything OUI/vendor lookups or raw SSDP headers alone provide (e.g.
-    "Living Room TV" or "Canon MG3600 series" instead of just a vendor
-    name). This is optional per-response best-effort enrichment: a
-    device whose description fetch fails or times out still gets
-    reported with whatever the M-SEARCH response itself contained.
-
-Rules (same isolation pattern as mdns_discovery.py / dhcp_sniffer.py):
-  - No Scapy/Nmap import, no storage, no trust logic.
-  - Pure: query for `timeout` seconds, return whatever responded.
-  - Does NOT know which MAC owns a responding IP — same IP-layer-only
-    limitation as mDNS; correlating IP→MAC is the scheduler's job.
-  - Every failure mode (socket error, malformed response, unreachable
-    LOCATION URL, malformed XML) is caught and degrades gracefully —
-    one bad device must never prevent reporting every other device
-    that responded correctly.
+Pure: query for `timeout` seconds, return whatever responded. Doesn't
+know which MAC owns a responding IP, same IP-layer limitation as mDNS
+— correlating that is the scheduler's job. Every failure mode (socket
+error, malformed response, unreachable LOCATION, bad XML) degrades
+gracefully so one bad device never blocks reporting the rest.
 
 Usage:
     ssdp = SSDPDiscovery(timeout=4)

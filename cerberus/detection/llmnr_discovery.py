@@ -1,55 +1,30 @@
-# deps: none — stdlib only (socket, struct)
 """
-detection/llmnr_discovery.py
+Active LLMNR reverse lookup — given IPs already confirmed alive, asks
+each one directly "what's your hostname?" via an LLMNR PTR query.
+LLMNR is Windows' fallback name resolution protocol, on by default on
+most installs, and answers even from machines that skip mDNS and don't
+respond usefully to NetBIOS behind a firewall profile — a fourth
+independent hostname signal alongside mdns/dhcp/ssdp, covering the
+Windows boxes the other three sometimes miss.
 
-Job: active LLMNR (Link-Local Multicast Name Resolution) reverse
-lookup — given a list of IPs already confirmed alive, ask each one
-directly "what's your hostname?" via an LLMNR PTR query.
+Unlike mDNS/SSDP's "broadcast a question, see who answers," this is a
+reverse lookup for a specific known IP, so resolve() takes a list of
+target IPs — the scheduler injects the currently-alive IPs from its
+ARP cache, the same way scanner_scapy.py takes a CIDR instead of
+detecting one. This module never goes looking for IPs on its own.
 
-Why this exists:
-  LLMNR is Windows' fallback name-resolution protocol (used when DNS
-  can't resolve a name) and is enabled by default on most Windows
-  installs. Windows machines that don't run mDNS and don't always
-  respond usefully to NetBIOS/SMB queries (nbstat can be blocked by
-  firewall profiles, especially "Public" network profiles) will often
-  still answer an LLMNR query — this is a FOURTH independent hostname
-  signal alongside mDNS (mdns_discovery.py), DHCP (dhcp_sniffer.py),
-  and SSDP (ssdp_discovery.py), specifically covering the Windows
-  machines the other three sometimes miss.
+Hand-built rather than pulling in a DNS library: LLMNR reuses the
+standard DNS wire format (RFC 4795 §2.1), the stdlib has no DNS
+parser, and the format itself — a fixed 12-byte header plus
+length-prefixed labels, including pointer-based name compression,
+which real Windows replies almost always use — is small enough to
+implement and test directly without a new dependency.
 
-Architectural difference from mDNS/SSDP (read before assuming the
-same "browse for anything" pattern applies):
-  mDNS and SSDP are both "broadcast a question, see who answers" —
-  self-contained calls needing no external input. LLMNR's useful mode
-  here is the OPPOSITE: a REVERSE lookup for a SPECIFIC already-known
-  IP ("who are you?"), not a forward lookup for a name we don't have.
-  This means resolve() takes a list of target IPs as a parameter — the
-  scheduler must inject the list of currently-alive IPs (from its
-  Scapy ARP cache), the same way scanner_scapy.py's scan() takes a
-  network CIDR as a parameter instead of detecting it itself. This
-  module never goes looking for IPs on its own.
-
-Why this is hand-built instead of using a DNS library:
-  LLMNR reuses the standard DNS wire format (RFC 4795 §2.1: "the
-  packet formats for the LLMNR query and response are copied from the
-  DNS query and response formats"), but the stdlib has no DNS message
-  builder/parser and this project avoids adding a new third-party
-  dependency for something this self-contained. The wire format is a
-  fixed, well-documented 12-byte header plus length-prefixed labels —
-  small enough to implement and unit-test directly, including the
-  pointer-based name COMPRESSION real-world responses almost always
-  use (a bare, uncompressed implementation would silently fail to
-  parse most genuine Windows LLMNR replies).
-
-Rules (same isolation pattern as mdns_discovery.py / ssdp_discovery.py):
-  - No Scapy/Nmap import, no storage, no trust logic.
-  - Pure: given IPs, query and wait `timeout` seconds, return whatever
-    answered. Does NOT decide which IPs are worth asking — that's the
-    scheduler's job, using its own live-host knowledge.
-  - Every failure mode (socket error, malformed/truncated response,
-    a target host with LLMNR disabled entirely — the overwhelming
-    majority of non-Windows devices) degrades to "that IP just isn't
-    in the results," never a crash.
+Pure: query, wait `timeout` seconds, return whatever answered; doesn't
+decide which IPs are worth asking. Every failure mode — socket error,
+malformed response, LLMNR just disabled on the target (true for most
+non-Windows devices) — degrades to "that IP isn't in the results,"
+never a crash.
 
 Usage:
     llmnr = LLMNRDiscovery(timeout=2)

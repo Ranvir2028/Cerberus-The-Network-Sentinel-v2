@@ -1,44 +1,35 @@
-# deps: none — sqlite3 is stdlib
 """
-storage/device_store.py
+The only module in the project allowed to open a SQLite connection.
 
-ONLY module in the entire project allowed to open a SQLite connection.
+Schema covers devices and scan_history from early on, alerts_log for
+persistent alert history, and used_tokens for the email Trust/Block
+feature — tracking single-use Trust confirmation tokens so a token can
+only ever be redeemed once (protects against email prefetch scanners,
+forwarded emails, or a link clicked twice).
 
-Schema (Phase 1+2): devices, scan_history tables.
-Schema (Phase 3, module 13): alerts_log table for persistent alert history.
-Schema (email Trust/Block feature, this revision): used_tokens table —
-tracks single-use Trust confirmation tokens embedded in alert emails,
-so a token can only ever be redeemed once (protects against email
-prefetch scanners, forwarded emails, or a link being clicked twice).
+update_hostname_from_mdns() only writes if the device currently has no
+hostname — mDNS is a secondary signal and should never overwrite what
+Nmap's NetBIOS/SMB scripts already found. update_vendor_if_missing()
+follows the same pattern: Nmap ships its own small internal MAC-vendor
+database, much smaller than Cerberus's own VendorLookup (39k+ real
+IEEE OUI entries), so when Nmap comes up empty on vendor, the
+scheduler (which already holds a VendorLookup instance for alert
+tagging) can backfill it here — but only if vendor is currently NULL,
+never overwriting something Nmap did successfully identify even if
+Cerberus's DB would word it differently for the same OUI.
 
-mDNS hostname enrichment: update_hostname_from_mdns() — only writes if
-the device currently has NO hostname. mDNS is a secondary signal, never
-overwrites what Nmap's NetBIOS/SMB scripts already found.
+MACs are stored and keyed lowercase throughout.
 
-Vendor enrichment (this revision): update_vendor_if_missing() — same
-pattern as the mDNS fix. Nmap ships its own small internal MAC-vendor
-database, separate from and much smaller than Cerberus's own
-VendorLookup (39k+ real IEEE OUI entries). When Nmap comes up empty on
-vendor for a device, the scheduler (which already holds a VendorLookup
-instance for alert-message tagging) can now backfill it here. Only
-writes if vendor is currently NULL/empty — never overwrites a vendor
-Nmap DID successfully identify, even if Cerberus's DB would give a
-differently-worded name for the same OUI.
-
-MAC normalization: all MACs stored and keyed lowercase.
-
-Trust-link token tracking (this revision):
-  utils/link_tokens.py generates a signed, time-limited token per MAC
-  when an alert email is composed. This module does NOT verify
-  signatures or expiry — that's link_tokens.py's job, since it's pure
-  crypto/logic with no DB dependency. This module's ONLY job is the
-  "single-use" half: recording that a specific token_id has been
-  redeemed, so a second click (or a prefetch-scanner's first click)
-  on the same link is rejected. mark_token_used() is atomic via
-  INSERT — a UNIQUE constraint on token_id means a race between two
-  near-simultaneous requests for the same token can only ever let one
-  succeed, the other gets a rowcount of 0 / IntegrityError, both
-  handled the same way: "already used."
+link_tokens.py generates a signed, time-limited token per MAC when an
+alert email goes out; this module doesn't verify signatures or expiry
+(that's link_tokens.py's job, pure crypto with no DB dependency) — its
+only job is the single-use half: recording that a token_id has been
+redeemed so a second click, or a prefetch scanner's first click, gets
+rejected. mark_token_used() is atomic via INSERT with a UNIQUE
+constraint on token_id, so a race between two near-simultaneous
+requests for the same token can only ever let one succeed; the other
+gets rowcount 0 / IntegrityError, both handled the same way —
+"already used."
 """
 
 import sqlite3
@@ -581,7 +572,7 @@ class DeviceStore:
         return deleted
 
     # ------------------------------------------------------------------
-    # Public API — Trust-link token tracking (this revision)
+    # Public API — Trust-link token tracking
     # ------------------------------------------------------------------
 
     def mark_token_used(
@@ -948,7 +939,7 @@ if __name__ == "__main__":
         assert v_updated_unknown is False
         print("[PASS] vendor enrichment on unknown MAC → False, no crash")
 
-        # --- Trust-link token tracking (this revision) ---
+        # --- Trust-link token tracking ---
         from datetime import datetime, timezone, timedelta
         future_expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(timespec="seconds")
 

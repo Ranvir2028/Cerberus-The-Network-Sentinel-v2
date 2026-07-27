@@ -1,40 +1,29 @@
-# deps: none beyond stdlib + project modules
 """
-service/cerberus_service.py
+The seam: both cli/terminal.py and api/server.py call only this class,
+never storage, intelligence, or alerts directly. Right now it's just a
+plain Python class both import directly — but if Cerberus ever needs a
+true client-server split, this is exactly where a network call gets
+inserted without touching CLI or web code at all.
 
-THE SEAM. Both cli/terminal.py (Module 14) and api/server.py (Module 15)
-are required to call ONLY this class — never storage, intelligence, or
-alerts directly.
+Owns zero logic of its own — every method is a thin dispatch into
+storage / intelligence / alerts, no business decisions here. Never
+opens a DB connection, never reads env vars or config directly, never
+imports scapy/nmap; pure orchestration of already-built modules. Trust
+mutations (trust/untrust) also clear the device's alert cooldown via
+alert_manager.clear_cooldown() — this is the one place that knows
+trust-engine state and alert-manager state are related, so CLI and API
+don't each have to remember to make both calls. Learning-mode controls
+are the same thin-dispatch pattern into LearningMode (see its
+cross-process sync note for why stop_learning_mode() from a CLI
+process can still reach a scanner running elsewhere).
 
-This is the literal embodiment of "function call beats an API call, but
-design the seam" — today this is a plain Python class CLI and Flask/FastAPI
-both import directly. If Cerberus ever needs a true client-server split,
-this is exactly where a network call gets inserted, without touching CLI
-or web code at all. Nothing outside this file should need to change.
-
-Rules:
-  - Owns ZERO logic of its own. Every method is a thin dispatch into
-    storage / intelligence / alerts. No business decisions happen here.
-  - Never opens a DB connection, never reads env vars/config directly,
-    never imports scapy/nmap. Pure orchestration of already-built modules.
-  - Trust mutations (trust/untrust) ALSO clear the device's alert cooldown
-    via alert_manager.clear_cooldown() — this is the one place that
-    "knows" trust-engine state and alert-manager state are related, so
-    CLI/API don't each need to remember to do both calls themselves.
-  - Learning-mode controls are thin dispatches into LearningMode, same
-    pattern as everything else. See learning_mode.py's cross-process
-    sync note for why stop_learning_mode() called from a CLI process
-    can still affect a scanner running in a different process.
-
-Trust-link token redemption (this revision):
-  verify_trust_token() / redeem_trust_token() give api/server.py's
-  /confirm/trust/<token> routes a way to check and act on email Trust
-  links WITHOUT that file ever importing utils/link_tokens or
-  storage/device_store directly — the "never touches storage directly"
-  rule for CLI/API applies here too, token verification is no
-  exception. link_secret is INJECTED at construction (by whoever builds
-  this service — cerberus_main.py), never read from config here, same
-  injection pattern as every other optional dependency below.
+verify_trust_token() / redeem_trust_token() let server.py's
+/confirm/trust/<token> routes check and act on email Trust links
+without that file ever importing link_tokens or device_store
+directly — same "never touch storage directly" rule as everything
+else CLI/API-facing. link_secret is injected at construction (by
+cerberus_main.py, whoever builds this service), never read from
+config here — same injection pattern as every other optional dependency.
 """
 
 import logging
@@ -171,7 +160,7 @@ class CerberusService:
         """
         Persistent alert history — every alert that was actually fired
         (post-cooldown), newest first. Backed by device_store's
-        alerts_log table (see Phase 3 module 13 prep in scheduler.py).
+        alerts_log table (see scheduler.py for how it's populated).
         """
         return self._store.get_recent_alerts(limit=limit)
 
@@ -313,7 +302,7 @@ class CerberusService:
         return status
 
     # ------------------------------------------------------------------
-    # Trust-link token redemption (this revision)
+    # Trust-link token redemption
     # ------------------------------------------------------------------
 
     def verify_trust_token(self, token: str) -> Dict:
@@ -444,7 +433,7 @@ class CerberusService:
         }
 
     # ------------------------------------------------------------------
-    # Device self-identification links (this revision)
+    # Device self-identification links
     # ------------------------------------------------------------------
     #
     # Design note: unlike the Trust links above (which the operator
@@ -655,7 +644,7 @@ class CerberusService:
         }
 
     # ------------------------------------------------------------------
-    # Settings (this revision)
+    # Settings
     # ------------------------------------------------------------------
     #
     # Scoped exception to "owns zero logic of its own, never reads

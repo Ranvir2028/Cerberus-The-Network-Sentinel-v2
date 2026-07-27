@@ -1,54 +1,35 @@
-# deps: pip install netifaces-plus
 """
-detection/router_detector.py
+Answers one question: what networks is this machine currently on, and
+how do I describe each in CIDR notation? Pure topology read —
+interfaces → IPs → networks → gateways, no Scapy, no Nmap, no DB
+touches. Zero active interfaces (airplane mode) just returns [], and
+every caller has to treat that as normal, not an error.
 
-Job: Answer ONE question — "what networks is this machine currently on,
-and how do I describe each one in CIDR notation?"
+Found and fixed a real bug here: Docker Desktop's WSL2 backend creates
+a virtual adapter that the old filtering missed, for two reasons. The
+interface-name filter (_is_virtual_interface_name, checking for
+"wsl"/"vethernet") assumed netifaces reports a human-readable adapter
+name — on some Windows setups it reports a raw GUID instead
+(e.g. "{51226080-FBDF-4025-926E-...}"), which obviously never matches
+those markers. And the IP-range filter (_is_virtual_adapter) only
+covered a few fixed /24-ish ranges for VMware/VirtualBox/Docker
+Toolbox — WSL2's default NAT network isn't a fixed /24 at all, it's
+somewhere inside 172.16.0.0/12, varying per machine, so an adapter
+landing anywhere in that block (172.21.176.0/20 in the case that
+surfaced this) sailed straight through.
 
-Rules:
-- NO Scapy, NO Nmap, NO database touches.
-- Pure topology read: interfaces → IPs → networks → gateways.
-- Zero active interfaces (airplane mode) → returns [], never crashes.
-- Every downstream caller must treat [] as a normal, handleable state.
+Fixed by swapping the ad-hoc string-prefix matching for real CIDR
+containment checks via the stdlib `ipaddress` module, and adding
+172.16.0.0/12 to the known-virtual-ranges list — more correct in
+general too, since it handles any prefix length instead of just the
+neat /24 boundaries someone wrote out by hand.
 
-Update (this revision) — WSL2 virtual-adapter filtering fixed properly:
-  A real bug was found in production: installing Docker Desktop (which
-  requires WSL2 as its backend) creates a new virtual network adapter
-  that the PREVIOUS version of this file's filtering failed to catch,
-  for two compounding reasons:
-
-    1. The interface-NAME filter (_is_virtual_interface_name, checking
-       for markers like "wsl"/"vethernet") assumed netifaces would
-       report a human-readable adapter name. On at least some Windows
-       configurations, netifaces-plus instead reports interfaces by
-       their raw GUID (e.g. "{51226080-FBDF-4025-926E-...}"), which
-       obviously never contains any of those marker substrings — the
-       name-based filter silently never had a chance to match.
-
-    2. The IP-RANGE filter (_is_virtual_adapter) only covered a few
-       FIXED /24-ish ranges specific to VMware/VirtualBox/Docker
-       Toolbox. WSL2's own default NAT network is NOT a fixed /24 —
-       it's assigned somewhere within the much larger 172.16.0.0/12
-       block (172.16.0.0–172.31.255.255), and the exact subnet can
-       vary per machine/reinstall. The old filter never accounted for
-       this entire range, so a WSL2 adapter landing anywhere in it
-       (e.g. the 172.21.176.0/20 seen in production) sailed straight
-       through undetected.
-
-  Fixed by replacing ad-hoc string-prefix matching with real CIDR
-  containment checks via the stdlib `ipaddress` module, and adding
-  172.16.0.0/12 to the known-virtual-ranges list. This is a genuinely
-  more correct approach than string prefixes in general (handles any
-  prefix length precisely, not just neat /24 boundaries written out by
-  hand), not just a one-off patch for this one range.
-
-  Practical impact of the bug before this fix: every detected "phantom"
-  virtual network gets its OWN full set of scan workers (Scapy + two
-  Nmap tiers, including a 4-thread aggressive pool) — on an 8-core
-  machine, one real network's workers competing with one phantom
-  network's workers for the same CPU cores measurably slows down
-  scanning of the network that actually matters, even though the
-  phantom network finds zero real devices every cycle.
+Why it mattered: every undetected phantom network got its own full
+set of scan workers (Scapy + two Nmap tiers, one of them a 4-thread
+aggressive pool). On an 8-core machine, a phantom network's workers
+competing for CPU with the real network's workers measurably slowed
+down scanning of the network that actually matters — for zero real
+devices found, every cycle.
 """
 
 import ipaddress

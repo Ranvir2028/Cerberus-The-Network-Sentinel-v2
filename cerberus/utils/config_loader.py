@@ -1,56 +1,34 @@
-# deps: pip install python-dotenv
 """
-utils/config_loader.py
+Central config: scan intervals, alert toggles, SMTP creds, DB path,
+learning-mode duration, mDNS settings, and the Trust/Block link secret +
+router admin creds. Env vars / .env take priority, config.json is the
+fallback for everything non-secret.
 
-Job: load scan intervals, alert toggles, SMTP credentials, DB path,
-learning-mode duration, mDNS settings, and (this revision) email
-Trust/Block link-signing secret + router admin credentials from
-environment variables first, with a JSON file as fallback/defaults.
+  1. env var / .env          (CERBERUS_SMTP_PASSWORD, etc.)
+  2. config/config.json
+  3. built-in default
 
-Rules:
-  - Loads .env file automatically on first import (python-dotenv).
-    The .env file lives at the project root (cerberus_v2/.env) and is
-    loaded with override=True — this project's .env always wins over
-    any stray system-wide environment variables.
-  - Secrets (SMTP password, API keys, link-signing secret, router
-    credentials) ONLY from env vars / .env — never from config.json,
-    never hardcoded.
-  - config.json holds non-secret settings (intervals, paths, toggles).
-  - Validates required fields and raises ConfigError with clear message.
-  - All other modules import get_config() — never read env vars themselves.
-  - config.json is created with safe defaults on first run if absent.
+Secrets never touch config.json — SMTP password, API key, link-signing
+secret, router creds all come from .env only, loaded once on import with
+override=True so this project's .env always wins over a stray
+system-wide var of the same name.
 
-Priority order per field:
-  1. Environment variable / .env file  (CERBERUS_SMTP_PASSWORD, etc.)
-  2. config/config.json value
-  3. Built-in default
+CERBERUS_LINK_SECRET signs the single-use Trust confirmation tokens in
+alert emails (see link_tokens.py). Kept separate from CERBERUS_API_SECRET
+on purpose — link tokens are short-lived and single-use, the API key is
+long-lived and reusable, so rotating one shouldn't force rotating the
+other. Leave it unset and a random one gets generated at startup with a
+warning logged; fine for a single process running locally, but it means
+old emailed Trust links break on restart and a second process (CLI vs
+main) won't agree on signatures. Set it explicitly for anything real.
 
-Email Trust/Block links (this revision):
-  CERBERUS_LINK_SECRET — signs the single-use Trust confirmation
-    tokens embedded in alert emails (see utils/link_tokens.py). This
-    is deliberately a SEPARATE secret from CERBERUS_API_SECRET: link
-    tokens are short-lived (hours) and single-use, while the API key
-    is long-lived and reusable — mixing the two would mean rotating
-    one forces rotating the other for no reason. If unset, a random
-    secret is generated at startup and logged as a warning — this
-    still works for a single always-on process, but any previously
-    emailed Trust links become invalid on restart, and multiple
-    processes (e.g. CLI + main) would disagree on signatures. Set it
-    explicitly in .env for anything beyond casual local testing.
-  CERBERUS_ROUTER_USER / CERBERUS_ROUTER_PASSWORD — displayed
-    (not auto-submitted) alongside the Block link in alert emails, so
-    the user can manually log into their router's admin page. Same
-    env-only rule as SMTP — never written to config.json.
+CERBERUS_ROUTER_USER / CERBERUS_ROUTER_PASSWORD just get displayed next
+to the Block link in alert emails so you can log into the router admin
+page yourself — nothing auto-submits them.
 
-Usage:
     from cerberus.utils.config_loader import get_config, ConfigError
-
     cfg = get_config()
-    db_path   = cfg.db_path
-    smtp_pass = cfg.smtp_password   # from .env / env only
-    interval  = cfg.scapy_interval
-    mdns_on   = cfg.mdns_enabled
-    link_key  = cfg.link_secret
+    cfg.db_path / cfg.smtp_password / cfg.scapy_interval / cfg.link_secret
 """
 
 import json
@@ -167,11 +145,11 @@ class CerberusConfig:
     api_enabled:     bool = True
     api_secret_key:  Optional[str] = None   # CERBERUS_API_SECRET env var
 
-    # --- mDNS discovery (Phase 3 hardening) ---
+    # --- mDNS discovery ---
     mdns_enabled:    bool = True   # Set False to disable the mDNS worker entirely
     mdns_interval:   int  = 120    # Seconds between mDNS browse cycles
 
-    # --- Additional passive/active discovery sources (this revision) ---
+    # --- Additional passive/active discovery sources ---
     dhcp_enabled:        bool = True   # Continuous background DHCP hostname sniffer
     dhcp_drain_interval: int  = 60     # Seconds between draining accumulated sightings
     ssdp_enabled:        bool = True   # UPnP/SSDP device discovery
@@ -179,14 +157,14 @@ class CerberusConfig:
     llmnr_enabled:       bool = True   # LLMNR reverse hostname lookup
     llmnr_interval:      int  = 90     # Seconds between LLMNR resolve cycles
 
-    # --- Learning mode state file (this revision) ---
+    # --- Learning mode state file ---
     # Previously hardcoded identically as a literal string in BOTH
     # cerberus_main.py and cli/terminal.py — two places that had to be
     # kept manually in sync with no enforcement. Centralizing here
     # removes that duplication risk entirely.
     learning_mode_state_file: str = "data/learning_mode.json"
 
-    # --- Email Trust/Block links (this revision) ---
+    # --- Email Trust/Block links ---
     link_secret:             Optional[str] = None   # CERBERUS_LINK_SECRET env var
     link_token_expiry_hours: int           = 72      # Trust link validity window
     router_user:             Optional[str] = None   # CERBERUS_ROUTER_USER env var
@@ -240,7 +218,7 @@ def reset_config() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Editable settings (this revision) — for the dashboard's Settings page.
+# Editable settings — used by the dashboard's Settings page.
 #
 # Deliberately a WHITELIST, not "everything in CerberusConfig": secrets
 # (smtp_password, api_secret_key, link_secret, router_user/password)
@@ -567,8 +545,8 @@ def _write_json(path, data: dict) -> None:
     """
     Write any dict to a config.json-shaped file. Generalized out of
     what used to be _write_default_config()'s hardcoded body, since
-    update_editable_settings() (this revision) needs to write an
-    arbitrary MERGED dict back, not just the original defaults.
+    update_editable_settings() needs to write an arbitrary MERGED dict
+    back, not just the original defaults.
 
     Accepts either a str or Path for `path` — coerced to Path
     immediately, since callers pass both (config_loader's internal

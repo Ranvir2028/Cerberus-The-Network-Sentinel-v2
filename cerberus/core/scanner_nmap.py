@@ -1,10 +1,9 @@
-# deps: pip install python-nmap
 # system: nmap must be installed → sudo apt install nmap / winget install nmap
 """
 core/scanner_nmap.py
 
-Three scan tiers — all return the same base dict shape so scheduler and
-device_store never need to care which tier produced a result:
+Three scan tiers, all returning the same base dict shape so scheduler
+and device_store never need to care which tier produced a result:
 
   scan_quick(network)
       Ping sweep (-sn). Fast. Returns {ip, mac, vendor, hostname, network,
@@ -22,11 +21,10 @@ device_store never need to care which tier produced a result:
       On-demand scan of one IP. Used when a brand-new MAC is spotted by
       Scapy mid-cycle and needs immediate fingerprinting.
 
-Rules (unchanged):
-  - NO RouterDetector import. Scheduler injects IPs/networks.
-  - NO storage, NO trust logic.
-  - Any failure → return [] / None, never crash.
-  - nmap binary missing → log clearly, return empty on every call.
+No RouterDetector import — scheduler injects IPs/networks. No storage,
+no trust logic. Any failure returns [] / None rather than crashing,
+and a missing nmap binary just logs clearly and returns empty on every
+call.
 """
 
 import subprocess

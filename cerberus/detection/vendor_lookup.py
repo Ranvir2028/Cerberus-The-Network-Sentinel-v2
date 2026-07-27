@@ -1,40 +1,16 @@
-# deps: none — stdlib only, uses bundled OUI data file
 """
-detection/vendor_lookup.py
+Maps a MAC address to a manufacturer name using the OUI (the first 3
+bytes) against data/oui.txt, a local vendor database bundled with the
+project — no network call, ever. Unknown OUIs just return None.
 
-Job: pure lookup — given a MAC address, return the manufacturer name
-using the OUI (first three bytes / first 6 hex chars) against a local
-vendor database file bundled with the project.
+is_likely_hypervisor() is a separate, purely cosmetic check: it flags
+vendor strings that belong to VMware/VirtualBox/Hyper-V/QEMU/etc so the
+CLI and alert_manager can label a device "possible VM on this machine"
+instead of it looking like a mystery intruder. It doesn't change any
+trust decision — a bridged VM is still a real device and still shows
+up in scans like anything else.
 
-Rules:
-  - No network calls at runtime. Database is a local file, always available.
-  - No side effects, no state beyond the in-memory cache loaded once at init.
-  - No scanning, no storage, no trust logic.
-  - Used by trust_engine (vendor-pattern correlation) and by CLI/alerts
-    for human-readable device output.
-  - Unknown OUI → returns None cleanly, never raises.
-
-Database file:
-  data/oui.txt — tab-separated, one entry per line:
-  OUI_PREFIX<TAB>VENDOR_NAME
-  e.g.:
-  00177C  Smartlink Network Systems Limited
-  A4C138  Apple, Inc.
-
-  File is bundled with the project (not downloaded at runtime).
-  Update it by running: python -m cerberus.detection.vendor_lookup --update
-
-Hypervisor detection (added Phase 3 hardening):
-  is_likely_hypervisor() flags vendor strings belonging to known
-  virtualization platforms (VMware, VirtualBox, Hyper-V, QEMU, etc).
-  This does NOT auto-trust or hide these devices — a VM bridged onto
-  the real LAN is a genuine, separate device and must still show up in
-  scans. It only adds a human-readable annotation ("possible VM on
-  this machine") so an operator isn't startled by what is most likely
-  their own virtual machine rather than an intruder. The trust decision
-  itself is untouched — this is purely a display/messaging aid used by
-  alert_manager and the CLI. The OUI database below is otherwise byte-
-  for-byte identical to the original — nothing was removed to add this.
+Update the bundled OUI file with: python -m cerberus.detection.vendor_lookup --update
 """
 
 import logging

@@ -1,40 +1,18 @@
 """
-alerts/email_alert.py
+One concrete alert channel: SMTP send, given a verdict plus an already-
+composed AlertMessage. Reads SMTP creds from get_config() only, knows
+nothing about cooldowns/trust/scanning — alert_manager decides whether
+to call this and builds the whole message, this file just sends it.
+Signature matches what register_channel() expects:
+send_fn(verdict, message) -> None. Raises on failure (alert_manager
+already wraps each channel in try/except so one bad channel doesn't
+block the rest). No-ops quietly if email_alerts_enabled is False.
 
-Job: one concrete alert channel — SMTP send, given a verdict + composed
-AlertMessage (see alerts/alert_manager.py's AlertMessage dataclass).
-
-Rules:
-  - Reads SMTP credentials from config_loader.get_config() — never
-    hardcoded, never reads env vars or files directly itself.
-  - Knows NOTHING about cooldowns, trust logic, scanning, or how the
-    message body/links were built. alert_manager decides WHETHER to
-    call this and builds the ENTIRE message content — this module only
-    knows HOW to send it.
-  - Matches the (verdict, message) signature alert_manager.register_channel()
-    expects: send_fn(verdict: DeviceVerdict, message: AlertMessage) -> None
-  - Any send failure raises — alert_manager already wraps channel calls
-    in try/except per-channel, so a raised exception here is caught
-    there and logged, without blocking other registered channels.
-  - If email_alerts_enabled is False in config, send() is a no-op that
-    logs at DEBUG and returns — lets you register the channel
-    unconditionally without an extra "if enabled" check at every call site.
-
-Multipart HTML email (this revision):
-  message now carries BOTH .text and .html bodies (see AlertMessage in
-  alert_manager.py) instead of a single plain string. This module sends
-  them as a multipart/alternative MIME message — every email client
-  picks whichever part it supports; clients that render HTML show the
-  styled Trust/Block buttons, text-only clients (and screen readers)
-  fall back to .text, which contains the same information as plain
-  URLs instead of styled links. The plain-text part is listed FIRST in
-  the MIME structure per RFC 2046's ordering convention (least-preferred
-  alternative first) — most clients render the LAST part they support,
-  so HTML lands last and is what's actually shown wherever HTML
-  rendering is available.
-
-Usage:
-    from cerberus.alerts.email_alert import EmailAlert
+Sends the message as multipart/alternative: text part first, HTML part
+last, per RFC 2046's convention that clients render the last part they
+support — so HTML-capable clients show the styled Trust/Block buttons
+and everything else falls back to plain text with the same info as
+plain URLs.
 
     email = EmailAlert()
     alert_manager.register_channel(email.send)
@@ -62,7 +40,7 @@ class EmailAlert:
         email.send(verdict, message)   # called by alert_manager._fire()
                                         # message is an AlertMessage
                                         # (see alert_manager.py), not a
-                                        # plain string, as of this revision
+                                        # plain string
     """
 
     def __init__(self):

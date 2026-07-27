@@ -1,62 +1,43 @@
-# deps: pip install requests
 """
-utils/npcap_installer.py
+Windows-only: checks for Npcap (the packet-capture driver Scapy needs
+on Windows for raw ARP scanning) and silently installs it if missing,
+no user interaction. On Linux/macOS every function here is a fast
+no-op — those platforms have native raw-socket support and don't need
+Npcap — but this module still has to be safely importable there too,
+not just gated at call time.
 
-Job: Windows only — checks for Npcap (the packet-capture driver
-Scapy needs on Windows for raw ARP scanning), and silently installs it
-if missing, with no user interaction required. On any non-Windows
-platform, every function here is a fast, harmless no-op — Linux/macOS
-don't need Npcap at all (they have native raw-socket support), and
-this module must be safely IMPORTABLE on those platforms too, not just
-"gated at call time" — see the critical fix below.
+Fully non-interactive: check → if missing, silently download and
+install with recommended options → log the outcome → return whether
+scanning can proceed. No input() prompts, since Cerberus may run
+non-interactively (scheduled task, background service, eventually a
+container) where a blocking prompt would just hang forever.
 
-Non-interactive by design (this revision):
-  Earlier versions of this module prompted the user with a menu
-  (auto-install / manual / skip / exit) via input(). That's been
-  removed entirely — Cerberus now handles this fully underneath, with
-  no prompts: check → (if missing) silently download and install with
-  recommended options → log the outcome → return whether scanning can
-  proceed. This matters because Cerberus may eventually run
-  non-interactively (a scheduled task, a background service, later a
-  container) where a blocking input() call would hang forever with no
-  way to respond to it.
+Fixed a real cross-platform bug here: the module used to `import
+winreg` unconditionally at module level. winreg is Windows-only in the
+stdlib, so importing it on Linux/macOS raised ModuleNotFoundError
+immediately — which crashed this module's import, which crashed
+cerberus_main.py's own import chain (it imports
+handle_npcap_installation from here), breaking Cerberus entirely on
+non-Windows, not just disabling the Npcap-specific bits. Fixed by
+wrapping the winreg import in try/except at module level, same
+fallback pattern as the logger import just below it — every function
+that actually uses winreg was already gated behind is_windows()
+checks, so the problem was purely the unconditional import.
 
-Critical cross-platform fix (this revision):
-  The previous version did `import winreg` UNCONDITIONALLY at module
-  level. winreg is a WINDOWS-ONLY stdlib module — importing it on
-  Linux/macOS raises ModuleNotFoundError immediately, which would
-  crash the import of this ENTIRE module on any non-Windows machine,
-  which in turn would crash cerberus_main.py's own import chain (it
-  imports handle_npcap_installation from here) — breaking Cerberus
-  completely on Linux/macOS, not just disabling the Npcap-specific
-  functionality. This is fixed by importing winreg inside a try/except
-  at module level, exactly like the existing cerberus_logger fallback
-  pattern already used just below it. Every function that actually
-  USES winreg is already gated behind is_windows() checks — the
-  problem was purely the unconditional import itself, not the logic
-  that consumes it.
+Also fixed: is_npcap_installed() had no return if none of its three
+detection methods succeeded, which crashed every caller doing
+`installed, method = is_npcap_installed()` with a TypeError right in
+the exact case — Npcap genuinely missing — the function exists to
+handle; now falls through to an explicit `return False, "not
+detected"`. Removed a duplicate `import subprocess`. Fixed the logger
+fallback import, which pointed at a top-level module that doesn't
+exist in this project (it actually lives at cerberus.utils.logger).
 
-Other fixes applied this revision:
-  1. is_npcap_installed() had no return statement if none of its three
-     detection methods succeeded — every caller does
-     `installed, method = is_npcap_installed()`, which would raise
-     TypeError (cannot unpack None) the moment Npcap genuinely wasn't
-     found, which is exactly the case this function exists to detect.
-     Fixed: falls through to an explicit `return False, "not detected"`.
-  2. Duplicate `import subprocess` line removed.
-  3. The `cerberus_logger` fallback import referenced a top-level
-     module that doesn't exist in this project (the real logger lives
-     at cerberus.utils.logger) — fixed to import from the correct path,
-     with the same try/except fallback pattern preserved for safety.
-
-Features:
-    1) Checks if Npcap is already installed (multiple detection methods)
-    2) Downloads the latest Npcap installer if missing
-    3) Installs silently with recommended options
-    4) Logs a clear warning and continues in limited-scanning mode if
-       installation isn't possible (e.g. no admin rights) — never
-       blocks Cerberus from starting entirely over this
-    5) No user interaction required anywhere in this flow
+Checks install status via multiple detection methods, downloads and
+silently installs the latest Npcap if missing, and if installation
+isn't possible (no admin rights, etc) logs a clear warning and
+continues in limited-scanning mode rather than blocking Cerberus from
+starting at all.
 """
 
 import os

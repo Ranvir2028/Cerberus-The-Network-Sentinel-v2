@@ -1,40 +1,30 @@
-# deps: none — uses only stdlib + device_store output
 """
-intelligence/trust_engine.py
+Takes the current device list from storage and answers one question
+per device: trusted, untrusted-new, or untrusted-returning?
 
-Job: takes the current device list from storage and answers exactly one
-question per device — trusted, untrusted-new, or untrusted-returning?
+  TRUSTED             — MAC marked trusted in the DB. No alert.
+  UNTRUSTED_NEW       — MAC never seen before. Alert immediately.
+  UNTRUSTED_RETURNING — MAC seen before (has first_seen history) but
+                         not marked trusted — was unknown, went
+                         offline, came back. Lower severity than brand-new.
 
-Three verdicts:
-  TRUSTED            — MAC is marked trusted in the DB. No alert.
-  UNTRUSTED_NEW      — MAC never seen before. Alert immediately.
-  UNTRUSTED_RETURNING — MAC was seen before (has first_seen history) but
-                        is NOT marked trusted. Was previously unknown,
-                        went offline, came back. Alert but at lower severity
-                        than a brand-new device.
+The core fix over the original v1 approach: a device that WAS trusted,
+went to sleep, and came back must not get re-flagged as an intruder.
+The engine checks the trusted flag in the DB, not "did I see this MAC
+last cycle" — Scapy missing a device for one cycle (asleep, dropped
+ARP packet) is normal, and only trusted=False should ever trigger an alert.
 
-The core fix for the original Cerberus v1 problem:
-  A device that WAS trusted, went to sleep, and came back must NOT be
-  re-flagged as an intruder. The engine checks the trusted flag in the
-  DB — not "did I see this MAC in the last scan cycle". Scapy missing a
-  device for one cycle is normal (device asleep, ARP packet dropped).
-  Only a MAC that is explicitly marked trusted=False triggers an alert.
+Modern phones randomize their MAC per network session, which makes a
+returning device look brand new every time. To cut down false
+positives from that, the engine falls back to secondary signals —
+hostname match, vendor/OUI match, label match — against known trusted
+devices. A match downgrades the verdict from UNTRUSTED_NEW to
+UNTRUSTED_RETURNING with a MAC_RANDOMIZATION flag, but never
+auto-trusts; that decision stays with the operator.
 
-MAC randomization awareness:
-  Modern phones (iOS, Android, Windows Wi-Fi) randomize their MAC per
-  network session. A randomized MAC looks like a brand-new device every
-  time. The engine uses secondary signals to reduce false positives:
-    - hostname match against known trusted hostnames
-    - vendor/OUI match against known trusted vendors
-    - label match (user-assigned names)
-  If any secondary signal matches a trusted device, verdict is downgraded
-  from UNTRUSTED_NEW to UNTRUSTED_RETURNING with a MAC_RANDOMIZATION flag.
-  It does NOT auto-trust — that decision stays with the human operator.
-
-Labels:
-  Each device can have a human-readable label ("Harsh's Laptop",
-  "Living Room TV"). Trust engine uses labels as a secondary identity
-  signal and includes them in verdicts for CLI/alert display.
+Devices can also carry a human-readable label ("Harsh's Laptop",
+"Living Room TV"), used the same way as a secondary identity signal
+and passed through in verdicts for CLI/alert display.
 """
 
 import logging

@@ -150,7 +150,7 @@ function BellIcon() {
 // Small rotating radar ring used both in the header connection pill
 // and per-device in the table — a live sweep for active signals, a
 // dim static ring for dormant ones. Kept as one shared component so
-// both places always look identical.
+// both places always look identical
 function RadarRing({ active, size = 13 }) {
   return (
     <span

@@ -1,55 +1,31 @@
-# deps: none — stdlib only (hmac, hashlib, base64, json, secrets)
 """
-utils/link_tokens.py
+Generates and verifies signed, time-limited tokens for the email
+Trust-confirmation links (/confirm/trust/<token> in api/server.py,
+composed in alert_manager.py). Owns signature + expiry checking only —
+"already used" is device_store's used_tokens table
+(mark_token_used / is_token_used), checked separately by server.py
+after verify_token() passes here. Splitting it this way keeps this
+module DB-free and easy to unit-test, and keeps device_store as the
+one place that owns "has this been redeemed," consistent with it being
+the only module allowed to touch SQLite.
 
-Job: generate and verify signed, time-limited tokens embedded in email
-Trust-confirmation links (see api/server.py's /confirm/trust/<token>
-routes and alerts/alert_manager.py's email composition).
+Token format: <base64url-payload>.<hex-hmac-signature>, where the
+payload is JSON: mac (lowercase), purpose (e.g. "trust"), jti (random
+single-use id, the primary key used_tokens tracks), and exp (unix
+expiry). HMAC instead of a DB-only random token means server.py can
+verify authenticity and expiry without a DB round-trip and without
+ever storing the unredeemed token anywhere — the signature itself
+(derived from cfg.link_secret) proves it was genuinely issued by this
+instance. The DB only records tokens after redemption.
 
-This module owns SIGNATURE and EXPIRY verification only. It does NOT
-know about "already used" — that's storage/device_store.py's
-used_tokens table (mark_token_used / is_token_used), which is checked
-separately by api/server.py after a token passes verify_token() here.
-Splitting it this way keeps this module pure (no DB dependency, easy
-to unit-test) and keeps device_store.py as the single source of truth
-for "has this been redeemed," consistent with its existing role as the
-only module allowed to touch SQLite.
-
-Token format:
-    <base64url-payload>.<hex-hmac-signature>
-
-    payload (JSON, before encoding):
-        {
-            "mac":     "<lowercase mac the token authorizes>",
-            "purpose": "<what this token allows, e.g. 'trust'>",
-            "jti":     "<random single-use token id — the primary key
-                        device_store.used_tokens tracks>",
-            "exp":     <unix timestamp this token expires at>
-        }
-
-Why HMAC instead of a database-only random token:
-    A signed token lets api/server.py verify authenticity and expiry
-    WITHOUT a database round-trip, and — more importantly — without
-    ever needing to store the unredeemed token itself anywhere. Only
-    the token's own signature (derived from cfg.link_secret) proves it
-    was genuinely issued by this Cerberus instance; nothing needs to
-    be pre-recorded in the DB before the email is sent. The DB only
-    ever records tokens AFTER they're redeemed (used_tokens), which is
-    exactly the "single-use" half this module explicitly does not own.
-
-Security notes:
-    - Signature comparison uses hmac.compare_digest() — constant-time,
-      avoids timing-attack leakage on the signature bytes.
-    - jti (token id) is generated with secrets.token_urlsafe(), which
-      is cryptographically random — not guessable, not sequential.
-    - A token's mac/purpose/exp are all covered by the signature, so
-      none of them can be tampered with in transit (e.g. changing
-      which MAC gets trusted) without invalidating the signature.
-    - Tokens are self-contained and stateless until redeemed — losing
-      or restarting the DB does NOT invalidate outstanding unredeemed
-      tokens (only cfg.link_secret changing does, e.g. a restart with
-      no persisted CERBERUS_LINK_SECRET — see config_loader.py's
-      ephemeral-secret warning).
+Signature comparison uses hmac.compare_digest() for constant time, jti
+comes from secrets.token_urlsafe() so it's not guessable or
+sequential, and mac/purpose/exp are all covered by the signature so
+none of them can be tampered with in transit without invalidating it.
+Tokens are stateless until redeemed — losing or restarting the DB
+doesn't invalidate outstanding tokens, only cfg.link_secret changing
+does (e.g. a restart with no persisted CERBERUS_LINK_SECRET — see
+config_loader's ephemeral-secret warning).
 
 Usage:
     from cerberus.utils.link_tokens import generate_token, verify_token, TokenError

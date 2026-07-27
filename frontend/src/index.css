@@ -1,14 +1,8 @@
-/* ============================================================
+/* 
+============================================================
    Cerberus Dashboard — HUD / Targeting-Display Identity
-   ------------------------------------------------------------
-   Direction: engineering weapons-display, not "holographic AI
-   assistant blue glow" (that's its own cliché now). Signal reads
-   as two instruments, not one neon accent: arc-reactor cyan for
-   live/trusted state, molten copper for warnings/attention, hot
-   coral only for active threats. Panels are angular (clipped
-   corners, reticle brackets) instead of soft rounded cards.
-   Background carries a faint schematic grid, not flat void.
-   ============================================================ */
+============================================================ 
+*/
 
 :root {
   /* Color */

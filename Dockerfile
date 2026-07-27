@@ -25,7 +25,7 @@ COPY cerberus_main.py .
 # npcap_installer.py is deliberately NOT copied — see .dockerignore.
 # It's Windows-only and irrelevant inside a Linux container; the
 # import in cerberus_main.py is defensive specifically for this case
-# (see the try/except around it there).
+# (see the try/except around it there)
 
 RUN mkdir -p data logs config
 

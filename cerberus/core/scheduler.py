@@ -1,20 +1,17 @@
-# deps: none beyond stdlib + project modules
 """
-core/scheduler.py
-
-Three-tier scan coordinator per network:
+Three-tier scan coordinator, per network:
 
   Tier 1 — Scapy ARP        every 60s   → fast device presence
   Tier 2 — Nmap quick       every 180s  → vendor/hostname refresh
   Tier 3 — Nmap aggressive  every 360s  → full OS/port/service fingerprint
 
-Plus GLOBAL (not per-network) passive/active discovery tiers:
+Plus global (not per-network) passive/active discovery tiers:
 
   mDNS discovery   every mdns_interval  (default 120s) → hostname +
     model enrichment via Bonjour/Zeroconf, independent of MAC.
   DHCP sniffing    continuous background listener, drained every
-    dhcp_drain_interval (default 60s) → hostname enrichment, KEYED BY
-    MAC directly (the one source that gives us a MAC without needing
+    dhcp_drain_interval (default 60s) → hostname enrichment, keyed by
+    MAC directly (the one source that gives a MAC without needing
     IP-based device correlation).
   SSDP discovery   every ssdp_interval  (default 180s) → hostname +
     vendor + model enrichment via UPnP device descriptions.
@@ -22,48 +19,34 @@ Plus GLOBAL (not per-network) passive/active discovery tiers:
     enrichment via reverse lookup against currently-known live IPs
     (Windows machines that don't answer mDNS/NetBIOS).
 
-Lock model:
-  One threading.Lock per network CIDR. None of the GLOBAL discovery
-  tiers (mDNS/DHCP/SSDP/LLMNR) participate in this lock — they're all
-  passive listeners or narrow-scope active queries, not full-subnet
-  Scapy/Nmap scans, and each writes via its own narrow device_store
-  method rather than the general upsert() path.
+One threading.Lock per network CIDR. The global discovery tiers don't
+participate in it — they're passive listeners or narrow-scope active
+queries, not full-subnet Scapy/Nmap scans, and each writes through its
+own narrow device_store method rather than the general upsert() path.
 
-Live-host cache:
-  Scapy ARP results are stored in self._live_hosts[network] after every
-  sweep. Nmap quick and aggressive tiers read from this cache. LLMNR's
-  worker also reads from this cache (aggregated across all networks)
-  since its reverse-lookup queries need a list of IPs to ask, not a
-  self-contained "browse for anything" call — see
-  detection/llmnr_discovery.py's module docstring for why that source
-  is architecturally different from mDNS/SSDP.
+Scapy ARP results land in self._live_hosts[network] after every
+sweep; Nmap quick/aggressive both read from that cache. LLMNR's worker
+also reads from it (aggregated across all networks), since its
+reverse-lookup needs a list of IPs to ask rather than a self-contained
+browse call — see llmnr_discovery.py's docstring for why that's
+architecturally different from mDNS/SSDP.
 
-MAC normalization:
-  Scapy returns lowercase MACs, Nmap returns uppercase, DHCP sniffing
-  returns lowercase (see detection/dhcp_sniffer.py). All lowercased
-  before being handed to device_store.
+Scapy returns lowercase MACs, Nmap returns uppercase, DHCP sniffing
+returns lowercase — all get lowercased before reaching device_store.
 
-Alert wiring + persistence (Phase 3, modules 12/13):
-  alert_manager.process_verdicts() returns the fired verdicts; scheduler
-  persists each to device_store.log_alert().
+alert_manager.process_verdicts() returns the fired verdicts;
+scheduler persists each one to device_store.log_alert(). Scheduler
+also builds {network: gateway} from RouterDetector's output and hands
+it to alert_manager.set_network_gateways().
 
-Gateway hint wiring:
-  scheduler builds {network: gateway} from RouterDetector's output and
-  hands it to alert_manager.set_network_gateways().
+After every Nmap cycle, any device whose vendor Nmap couldn't identify
+gets backfilled via device_store.update_vendor_if_missing() using
+Cerberus's own richer OUI database (39k+ entries vs Nmap's small
+built-in one) — never overwriting a vendor Nmap did find.
 
-Vendor enrichment (Phase 3 revision):
-  Nmap ships its own small internal MAC-vendor database, separate from
-  and much smaller than Cerberus's own VendorLookup (39k+ real IEEE OUI
-  entries — see detection/vendor_lookup.py). After every Nmap quick/
-  aggressive cycle, any device whose vendor Nmap couldn't identify gets
-  backfilled via device_store.update_vendor_if_missing() using
-  Cerberus's richer database. Never overwrites a vendor Nmap DID find.
-
-Passive/active discovery enrichment (this revision):
-  Four independent, IP- or MAC-layer discovery sources now feed
-  device_store, each through its own narrow, "fill genuine gaps, never
-  overwrite" method — never through the general upsert() path, since
-  none of these sources are full scan results:
+Four independent discovery sources feed device_store through their
+own narrow "fill genuine gaps, never overwrite" methods, never the
+general upsert() path, since none of them are full scan results:
 
     Source   Key    Fields written                  device_store method
     ------   ---    --------------                  -------------------
@@ -75,29 +58,25 @@ Passive/active discovery enrichment (this revision):
     SSDP     IP     model (via model_name)            update_model_from_ip
     LLMNR    IP     hostname                          update_hostname_from_mdns
 
-  Note SSDP and LLMNR both reuse update_hostname_from_mdns() rather
-  than a same-purpose method under a different name — the underlying
-  SQL (IP-keyed, fill-if-missing) is identical regardless of which
-  protocol supplied the hostname, so a separate method per protocol
-  would just be duplicate code with no behavioral difference.
+SSDP and LLMNR both reuse update_hostname_from_mdns() rather than a
+same-purpose method under a different name, since the underlying SQL
+(IP-keyed, fill-if-missing) is identical no matter which protocol
+supplied the hostname — a separate method per protocol would just be
+duplicate code with no behavioral difference.
 
-  DHCP's known limitation (deliberate, not a bug): a DHCP sighting for
-  a MAC that device_store doesn't know about YET (i.e. arrived before
-  Scapy's ARP sweep ever saw that device) is simply dropped — not
-  retried on a later cycle, since drain_new_sightings() clears its
-  buffer on every call. In practice this is rare: a device actively
-  negotiating DHCP is, by definition, live on the network, and Scapy's
-  ARP sweep (scapy_interval, far more frequent than DHCP negotiations)
-  will almost always have discovered it first or in the same cycle.
+DHCP has a known, deliberate limitation: a sighting for a MAC
+device_store doesn't know about yet gets dropped rather than retried,
+since drain_new_sightings() clears its buffer on every call. Rare in
+practice — a device actively negotiating DHCP is by definition live,
+and Scapy's ARP sweep (far more frequent than DHCP negotiations) will
+almost always have caught it first or in the same cycle.
 
-Learning-mode auto-start (bugfix, this revision):
-  Scheduler no longer decides whether learning mode auto-starts — that
-  responsibility moved to cerberus_main.py, which now checks
-  learning_mode.has_ever_started() before calling start(), fixing the
-  bug where restarting the scanner after a deliberate `learning stop`
-  would silently re-open a fresh 24h window. Scheduler only ever reads
-  learning_mode.is_active() during scan cycles — it never calls start()
-  itself, in this revision or any previous one.
+Scheduler no longer decides whether learning mode auto-starts — that
+moved to cerberus_main.py, which checks
+learning_mode.has_ever_started() before calling start(), fixing a bug
+where restarting the scanner after a deliberate `learning stop` would
+silently reopen a fresh 24h window. Scheduler only ever reads
+learning_mode.is_active() during scan cycles; it never calls start() itself.
 """
 
 import time
@@ -694,7 +673,7 @@ class Scheduler:
         logger.info("[llmnr] Exiting")
 
     # ------------------------------------------------------------------
-    # Vendor enrichment (Phase 3 revision)
+    # Vendor enrichment
     # ------------------------------------------------------------------
 
     def _enrich_vendors(self, devices: List[Dict]) -> None:

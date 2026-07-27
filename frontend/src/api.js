@@ -1,18 +1,14 @@
-// Cerberus Dashboard — API client
-//
-// Talks ONLY to the embedded Flask API (api/server.py) — same seam
-// discipline as the CLI. Never assumes anything about storage/scheduler
-// internals; just calls the documented /api/* routes.
-//
-// Base URL comes from Vite env vars (see .env.example).
+// Talks only to the embedded Flask API — same seam discipline as the
+// CLI. Never assumes anything about storage/scheduler internals, just
+// calls the documented /api/* routes. Base URL comes from Vite env
+// vars, see .env.example.
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:5000";
 
-// Isolated on purpose: right now this just reads a fixed build-time env
-// var. Phase 5 (multi-user auth) will replace the BODY of this one
-// function with "read the token from login state" — every call site
-// below stays completely untouched, since they all just call
-// getApiKey() without caring where the value comes from.
+// Just reads a fixed build-time env var for now. A future login flow
+// would only need to change the body of this one function to pull the
+// token from login state instead — every call site below stays
+// untouched since they all just call getApiKey().
 function getApiKey() {
   return import.meta.env.VITE_API_KEY || "";
 }
