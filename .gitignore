@@ -43,8 +43,6 @@ data/devices.db-shm
 data/devices.db-wal
 data/*.db
 *.db
-!data/
-!data/*
 !data/oui.txt
 logs/
 *.log
