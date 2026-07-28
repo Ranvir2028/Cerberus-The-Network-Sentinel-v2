@@ -106,6 +106,31 @@ python -m cerberus.cli.terminal learning
 ```
 `--debug` for full tracebacks. `--help` for the complete flag list.
 
+## API
+ 
+Base `/api/*`, port `5000`. Requires `X-API-Key` if `CERBERUS_API_SECRET` is set (`/api/health` excepted).
+ 
+| Route | Method | Purpose |
+|---|---|---|
+| `/api/devices` | GET | List all devices |
+| `/api/devices/<mac>` | GET / DELETE | Detail / remove |
+| `/api/devices/<mac>/history` | GET | Scan history |
+| `/api/devices/<mac>/trust`, `/untrust` | POST | Change trust state |
+| `/api/devices/<mac>/label` | POST | Set display name |
+| `/api/devices/<mac>/request-id` | POST | Single-use "identify yourself" link for one device |
+| `/api/devices/counts` | GET | Trusted/untrusted/total |
+| `/api/alerts` | GET / DELETE | Alert log |
+| `/api/alerts/<id>` | DELETE | Remove one alert |
+| `/api/alerts/counts` | GET | Alert count summary |
+| `/api/alerts/manager-status` | GET | Cooldown/manager internal state |
+| `/api/learning`, `/start`, `/stop` | GET / POST | Learning-mode control |
+| `/api/scan/status` | GET | Live scan status |
+| `/api/settings` | GET / POST | Editable config |
+| `/api/status` | GET | Combined snapshot — what the dashboard polls most |
+| `/api/health` | GET | Liveness, no auth |
+ 
+`GET/POST /confirm/trust/<token>` and `/confirm/identify/<token>` sit outside `/api/*`, unauthenticated by design — the signed token is the credential, same as any password-reset email link.
+
 ## Architecture
 
 ```
