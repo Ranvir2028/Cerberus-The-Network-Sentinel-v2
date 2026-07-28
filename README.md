@@ -35,7 +35,7 @@ Raw ARP scanning needs real interface access. Docker's host-network mode only wo
 
 **Native:**
 ```bash
-git clone https://github.com/<your-username>/cerberus.git && cd cerberus
+git clone https://github.com/Ranvir2028/Cerberus-The-Network-Sentinel-v2.git && cd cerberus
 pip install -r requirements.txt
 cp .env.example .env                      # Setup this so that you can get the email alerts / Trust links
 cp frontend/.env.example frontend/.env    # Setup this so that you can get the defaults already work for localhost
