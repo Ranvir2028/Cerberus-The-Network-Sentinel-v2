@@ -1,4 +1,4 @@
-# Cerberus: The Network Sentinel
+# CERBERUS v2 — The Network Sentinel.
 
 A self-hosted network monitoring tool that watches every device on your LAN, tells the ones you actually own apart from the ones you don't, and tells you the moment something unfamiliar joins.
 
